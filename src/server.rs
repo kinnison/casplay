@@ -2,7 +2,7 @@
 
 use std::{
     cmp::min,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -10,10 +10,10 @@ use std::{
 use lazy_static::lazy_static;
 use regex::Regex;
 
+use prost::Message;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{async_trait, transport::Server, Code, Request, Response, Status, Streaming};
-use tracing::instrument;
 
 use crate::{
     build::bazel::{
@@ -25,8 +25,9 @@ use crate::{
             },
             digest_function, symlink_absolute_path_strategy, BatchReadBlobsRequest,
             BatchReadBlobsResponse, BatchUpdateBlobsRequest, BatchUpdateBlobsResponse,
-            CacheCapabilities, Digest, FindMissingBlobsRequest, FindMissingBlobsResponse,
-            GetCapabilitiesRequest, GetTreeRequest, GetTreeResponse, ServerCapabilities,
+            CacheCapabilities, Digest, Directory, FindMissingBlobsRequest,
+            FindMissingBlobsResponse, GetCapabilitiesRequest, GetTreeRequest, GetTreeResponse,
+            ServerCapabilities,
         },
         semver::SemVer,
     },
@@ -295,6 +296,7 @@ impl ByteStream for PlayByteStream {
     }
 }
 
+#[derive(Clone)]
 struct PlayCASServer {
     inner: Arc<Mutex<CASServer>>,
 }
@@ -307,6 +309,22 @@ impl PlayCASServer {
         self.inner
             .lock()
             .map_err(|_| Status::new(Code::Unknown, "Mutex poisoned?"))
+    }
+
+    fn get_dir(&self, digest: &Digest) -> Result<Directory, Status> {
+        let data = self
+            .server()?
+            .content
+            .get(digest)
+            .ok_or_else(|| Status::new(Code::NotFound, "unknown digest"))
+            .map(Arc::clone)?;
+        let dir: Directory = Directory::decode(data.as_ref()).map_err(|e| {
+            Status::new(
+                Code::InvalidArgument,
+                format!("Unable to decode directory {:?}: {:?}", digest, e),
+            )
+        })?;
+        Ok(dir)
     }
 }
 
@@ -361,6 +379,60 @@ impl ContentAddressableStorage for PlayCASServer {
         &self,
         request: Request<GetTreeRequest>,
     ) -> Result<Response<Self::GetTreeStream>, Status> {
-        Err(Status::new(Code::Unimplemented, "not implemented"))
+        if request.get_ref().instance_name != self.server()?.instance_name {
+            return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
+        }
+
+        let root_digest = request.into_inner().root_digest.unwrap();
+
+        let root_data = match self.server()?.content.get(&root_digest).map(Arc::clone) {
+            Some(data) => data,
+            None => return Err(Status::new(Code::NotFound, "Unknown root digest")),
+        };
+
+        let (tx, rx) = mpsc::channel(4);
+
+        let server = self.clone();
+
+        tokio::spawn(async move {
+            let root_dir: Directory = match server.get_dir(&root_digest) {
+                Ok(d) => d,
+                Err(e) => {
+                    tx.send(Err(e)).await.unwrap();
+                    return;
+                }
+            };
+            tx.send(Ok(GetTreeResponse {
+                directories: vec![root_dir.clone()],
+                next_page_token: "".into(),
+            }))
+            .await
+            .unwrap();
+            let mut to_send = VecDeque::new();
+            for dir in root_dir.directories {
+                to_send.push_back(dir.digest.unwrap());
+            }
+
+            while let Some(next_digest) = to_send.pop_front() {
+                let dir = match server.get_dir(&next_digest) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tx.send(Err(e)).await.unwrap();
+                        return;
+                    }
+                };
+                tx.send(Ok(GetTreeResponse {
+                    directories: vec![dir.clone()],
+                    next_page_token: "".into(),
+                }))
+                .await
+                .unwrap();
+                for dir in dir.directories {
+                    to_send.push_back(dir.digest.unwrap());
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
