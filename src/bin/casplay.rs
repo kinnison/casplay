@@ -11,15 +11,13 @@ use async_recursion::async_recursion;
 use async_stream::stream;
 use casplay::{
     build::bazel::remote::execution::v2::{
-        batch_update_blobs_request, capabilities_client::CapabilitiesClient, compressor,
-        content_addressable_storage_client::ContentAddressableStorageClient,
-        BatchUpdateBlobsRequest, Digest, Directory, DirectoryNode, FileNode,
-        FindMissingBlobsRequest, GetCapabilitiesRequest, GetTreeRequest, SymlinkNode,
+        capabilities_client::CapabilitiesClient,
+        content_addressable_storage_client::ContentAddressableStorageClient, Digest, Directory,
+        DirectoryNode, FileNode, FindMissingBlobsRequest, GetCapabilitiesRequest, GetTreeRequest,
+        SymlinkNode,
     },
-    google::{
-        bytestream::{byte_stream_client::ByteStreamClient, ReadRequest, WriteRequest},
-        rpc,
-    },
+    google::bytestream::{byte_stream_client::ByteStreamClient, ReadRequest, WriteRequest},
+    Uploader,
 };
 
 use clap::{Parser, Subcommand};
@@ -63,11 +61,13 @@ struct Config {
 async fn real_main() -> Crapshoot {
     let cli = Cli::parse();
 
-    let endpoint = cli.endpoint.unwrap_or("http://localhost:50052".into());
+    let endpoint = cli
+        .endpoint
+        .unwrap_or_else(|| "http://localhost:50052".into());
 
     let config = Config {
         endpoint,
-        instance_name: cli.instance.unwrap_or("".into()),
+        instance_name: cli.instance.unwrap_or_else(|| "".into()),
     };
 
     match cli.command {
@@ -280,7 +280,14 @@ async fn list_tree(config: &Config, name: &str) -> Crapshoot {
 }
 
 async fn upload_dir(config: &Config, name: &Path) -> Crapshoot {
-    let res = upload_dir_(config, name, "").await?;
+    let mut uploader = Uploader::new(
+        config.endpoint.clone(),
+        Some(config.instance_name.as_ref()),
+        None,
+    )
+    .await?;
+    let res = upload_dir_(&mut uploader, config, name, "").await?;
+    uploader.flush().await?;
     println!(
         "Uploaded directory {}, digest is {}/{}",
         name.display(),
@@ -291,7 +298,12 @@ async fn upload_dir(config: &Config, name: &Path) -> Crapshoot {
 }
 
 #[async_recursion]
-async fn upload_dir_(config: &Config, dir: &Path, base_name: &str) -> anyhow::Result<Digest> {
+async fn upload_dir_(
+    uploader: &mut Uploader,
+    config: &Config,
+    dir: &Path,
+    base_name: &str,
+) -> anyhow::Result<Digest> {
     let mut dir_reader = read_dir(dir).await?;
 
     let mut this_dir = Directory {
@@ -307,7 +319,8 @@ async fn upload_dir_(config: &Config, dir: &Path, base_name: &str) -> anyhow::Re
         let name = entry.file_name().to_string_lossy().to_string();
         if ftype.is_dir() {
             let subname = format!("{}{}/", base_name, name);
-            let digest = upload_dir_(config, &dir.join(entry.file_name()), &subname).await?;
+            let digest =
+                upload_dir_(uploader, config, &dir.join(entry.file_name()), &subname).await?;
             let node = DirectoryNode {
                 name: name.clone(),
                 digest: Some(digest),
@@ -315,7 +328,7 @@ async fn upload_dir_(config: &Config, dir: &Path, base_name: &str) -> anyhow::Re
             this_dir.directories.push(node);
         }
         if ftype.is_file() {
-            let digest = really_upload_blob(config, &entry.path()).await?;
+            let digest = uploader.upload_file(&entry.path()).await?;
             let perms = entry.metadata().await?.permissions();
             let executable = (perms.mode() & 0o111) != 0;
             let node = FileNode {
@@ -342,38 +355,5 @@ async fn upload_dir_(config: &Config, dir: &Path, base_name: &str) -> anyhow::Re
     this_dir.directories.sort_by_key(|e| e.name.clone());
     this_dir.symlinks.sort_by_key(|e| e.name.clone());
 
-    let enc = this_dir.encode_to_vec();
-    let sha = digest_bytes(&enc);
-    let digest = Digest {
-        hash: sha,
-        size_bytes: enc.len() as i64,
-    };
-    let mut client = ContentAddressableStorageClient::connect(config.endpoint.clone()).await?;
-
-    let request = BatchUpdateBlobsRequest {
-        instance_name: config.instance_name.clone(),
-        requests: vec![batch_update_blobs_request::Request {
-            digest: Some(digest.clone()),
-            data: enc,
-            compressor: compressor::Value::Identity as i32,
-        }],
-    };
-
-    let result = client.batch_update_blobs(request).await?.into_inner();
-
-    if result.responses.len() != 1 {
-        anyhow::bail!("Woah, didn't get the right result count");
-    }
-
-    if result.responses[0].digest.as_ref() != Some(&digest) {
-        anyhow::bail!("Woah, wrong file");
-    }
-
-    if let Some(status) = &result.responses[0].status {
-        if status.code != rpc::Code::Ok as i32 {
-            anyhow::bail!("Woah, upload of directory object failed!");
-        }
-    }
-
-    Ok(digest)
+    Ok(uploader.queue_message(this_dir).await?)
 }

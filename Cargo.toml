@@ -15,6 +15,8 @@ clap = { version = "3", features = ["derive"] }
 sha256 = "*"
 async-stream = "*"
 async-recursion = "*"
+uuid = { version = "0.8", features = ["v4"] }
+bytes = "*"
 
 [build-dependencies]
 tonic-build = "*"

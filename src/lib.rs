@@ -29,3 +29,6 @@ pub mod google {
         tonic::include_proto!("google.bytestream");
     }
 }
+
+pub mod uploader;
+pub use uploader::Uploader;
