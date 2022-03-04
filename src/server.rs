@@ -18,16 +18,25 @@ use tracing::instrument;
 use crate::{
     build::bazel::{
         remote::execution::v2::{
+            batch_update_blobs_response,
             capabilities_server::{Capabilities, CapabilitiesServer},
-            digest_function, symlink_absolute_path_strategy, CacheCapabilities, Digest,
-            GetCapabilitiesRequest, ServerCapabilities,
+            content_addressable_storage_server::{
+                ContentAddressableStorage, ContentAddressableStorageServer,
+            },
+            digest_function, symlink_absolute_path_strategy, BatchReadBlobsRequest,
+            BatchReadBlobsResponse, BatchUpdateBlobsRequest, BatchUpdateBlobsResponse,
+            CacheCapabilities, Digest, FindMissingBlobsRequest, FindMissingBlobsResponse,
+            GetCapabilitiesRequest, GetTreeRequest, GetTreeResponse, ServerCapabilities,
         },
         semver::SemVer,
     },
-    google::bytestream::{
-        byte_stream_server::{ByteStream, ByteStreamServer},
-        QueryWriteStatusRequest, QueryWriteStatusResponse, ReadRequest, ReadResponse, WriteRequest,
-        WriteResponse,
+    google::{
+        bytestream::{
+            byte_stream_server::{ByteStream, ByteStreamServer},
+            QueryWriteStatusRequest, QueryWriteStatusResponse, ReadRequest, ReadResponse,
+            WriteRequest, WriteResponse,
+        },
+        rpc,
     },
 };
 
@@ -40,6 +49,9 @@ pub async fn serve(dst: SocketAddr, instance_name: &str) -> anyhow::Result<()> {
         .add_service(ByteStreamServer::new(PlayByteStream::new(Arc::clone(
             &server,
         ))))
+        .add_service(ContentAddressableStorageServer::new(PlayCASServer::new(
+            Arc::clone(&server),
+        )))
         .serve(dst)
         .await?;
 
@@ -209,7 +221,7 @@ impl ByteStream for PlayByteStream {
 
         data.extend_from_slice(&firstmsg.data);
 
-        let mut finish_write = false;
+        let mut finish_write = firstmsg.finish_write;
 
         while let Some(msg) = wstream.message().await? {
             // Check the write_offset
@@ -280,5 +292,75 @@ impl ByteStream for PlayByteStream {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+struct PlayCASServer {
+    inner: Arc<Mutex<CASServer>>,
+}
+
+impl PlayCASServer {
+    fn new(inner: Arc<Mutex<CASServer>>) -> Self {
+        Self { inner }
+    }
+    fn server(&self) -> Result<MutexGuard<CASServer>, Status> {
+        self.inner
+            .lock()
+            .map_err(|_| Status::new(Code::Unknown, "Mutex poisoned?"))
+    }
+}
+
+#[async_trait]
+impl ContentAddressableStorage for PlayCASServer {
+    type GetTreeStream = ReceiverStream<Result<GetTreeResponse, Status>>;
+
+    async fn find_missing_blobs(
+        &self,
+        request: Request<FindMissingBlobsRequest>,
+    ) -> Result<Response<FindMissingBlobsResponse>, Status> {
+        Err(Status::new(Code::Unimplemented, "not implemented"))
+    }
+
+    async fn batch_update_blobs(
+        &self,
+        request: Request<BatchUpdateBlobsRequest>,
+    ) -> Result<Response<BatchUpdateBlobsResponse>, Status> {
+        if request.get_ref().instance_name != self.server()?.instance_name {
+            return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
+        }
+
+        let mut response = BatchUpdateBlobsResponse { responses: vec![] };
+
+        for request in request.into_inner().requests {
+            let data = request.data.into();
+            let digest = request.digest.unwrap();
+            println!("Batch: Inserting {:?}", digest);
+            self.server()?.content.insert(digest.clone(), data);
+            let entry = batch_update_blobs_response::Response {
+                digest: Some(digest),
+                status: Some(rpc::Status {
+                    code: rpc::Code::Ok as i32,
+                    message: "".into(),
+                    details: vec![],
+                }),
+            };
+            response.responses.push(entry);
+        }
+
+        Ok(Response::new(response))
+    }
+
+    async fn batch_read_blobs(
+        &self,
+        request: Request<BatchReadBlobsRequest>,
+    ) -> Result<Response<BatchReadBlobsResponse>, Status> {
+        Err(Status::new(Code::Unimplemented, "not implemented"))
+    }
+
+    async fn get_tree(
+        &self,
+        request: Request<GetTreeRequest>,
+    ) -> Result<Response<Self::GetTreeStream>, Status> {
+        Err(Status::new(Code::Unimplemented, "not implemented"))
     }
 }

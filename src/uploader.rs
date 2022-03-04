@@ -108,6 +108,8 @@ impl Uploader {
             self.max_batch_size = MAX_REQUEST_SIZE >> 1; // Conservative half max request batch
             self.max_individual = MAX_REQUEST_SIZE >> 3; // 25% of conservative batch size
         }
+        println!("Max batch size: {}", self.max_batch_size);
+        println!("Max individual file: {}", self.max_individual);
         Ok(())
     }
 
