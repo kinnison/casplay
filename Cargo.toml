@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "*"
 tokio = { version = "*", features = ["full"] }
+tokio-stream = "*"
 tonic = "*"
 prost = "*"
 prost-types = "*"
@@ -17,6 +18,10 @@ async-stream = "*"
 async-recursion = "*"
 uuid = { version = "0.8", features = ["v4"] }
 bytes = "*"
+regex = "*"
+lazy_static = "*"
+tracing-subscriber = "*"
+tracing = "*"
 
 [build-dependencies]
 tonic-build = "*"

@@ -44,6 +44,7 @@ enum Command {
     Fetch { name: String },
     Upload { name: PathBuf },
     Ls { name: String },
+    Serve,
 }
 
 type Crapshoot = anyhow::Result<()>;
@@ -75,8 +76,16 @@ async fn real_main() -> Crapshoot {
         Command::Fetch { name } => fetch_blob(&config, &name).await?,
         Command::Upload { name } => upload_blob(&config, &name).await?,
         Command::Ls { name } => list_tree(&config, &name).await?,
+        Command::Serve => serve(&config).await?,
     };
 
+    Ok(())
+}
+
+async fn serve(config: &Config) -> Crapshoot {
+    tracing_subscriber::fmt().init();
+
+    casplay::server::serve(([0, 0, 0, 0], 5000).into(), &config.instance_name).await?;
     Ok(())
 }
 
@@ -128,12 +137,12 @@ async fn really_upload_blob(config: &Config, name: &Path) -> anyhow::Result<Dige
     let sha = digest_file(name)?;
     let flen = metadata(name)?.len();
 
-    if has_blob(config, &sha, flen).await? {
-        return Ok(Digest {
-            hash: sha,
-            size_bytes: flen as i64,
-        });
-    }
+    // if has_blob(config, &sha, flen).await? {
+    //     return Ok(Digest {
+    //         hash: sha,
+    //         size_bytes: flen as i64,
+    //     });
+    // }
 
     let base_request = WriteRequest {
         resource_name: format!(
@@ -175,6 +184,7 @@ async fn really_upload_blob(config: &Config, name: &Path) -> anyhow::Result<Dige
 
     };
 
+    println!("About to call write!");
     let response = client.write(stream).await?;
 
     if response.get_ref().committed_size != flen as i64 {
