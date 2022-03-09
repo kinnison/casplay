@@ -13,8 +13,15 @@ use regex::Regex;
 use prost::Message;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{async_trait, transport::Server, Code, Request, Response, Status, Streaming};
-use tracing::{info, trace};
+use tonic::{
+    async_trait,
+    codegen::http::{self, HeaderMap},
+    metadata::MetadataMap,
+    service::interceptor,
+    transport::Server,
+    Code, Request, Response, Status, Streaming,
+};
+use tracing::{info, span, trace, Level, Span};
 
 use crate::{
     build::bazel::{
@@ -28,7 +35,7 @@ use crate::{
             BatchReadBlobsResponse, BatchUpdateBlobsRequest, BatchUpdateBlobsResponse,
             CacheCapabilities, Digest, Directory, FindMissingBlobsRequest,
             FindMissingBlobsResponse, GetCapabilitiesRequest, GetTreeRequest, GetTreeResponse,
-            ServerCapabilities,
+            RequestMetadata, ServerCapabilities, ToolDetails,
         },
         semver::SemVer,
     },
@@ -45,6 +52,8 @@ use crate::{
 pub async fn serve(dst: SocketAddr, instance_name: &str) -> anyhow::Result<()> {
     let server = Arc::new(Mutex::new(CASServer::new(instance_name)));
     Server::builder()
+        .trace_fn(tracing_span)
+        .layer(interceptor(show_metadata))
         .add_service(CapabilitiesServer::new(PlayCapabilities::new(Arc::clone(
             &server,
         ))))
@@ -58,6 +67,64 @@ pub async fn serve(dst: SocketAddr, instance_name: &str) -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+trait HeaderGet {
+    fn get(&self, key: &str) -> Option<&[u8]>;
+}
+
+impl HeaderGet for HeaderMap {
+    fn get(&self, key: &str) -> Option<&[u8]> {
+        self.get(key).map(|v| v.as_bytes())
+    }
+}
+
+impl HeaderGet for MetadataMap {
+    fn get(&self, key: &str) -> Option<&[u8]> {
+        self.get_bin(key).map(|v| v.as_ref())
+    }
+}
+
+fn extract_metadata(headers: &impl HeaderGet) -> Option<RequestMetadata> {
+    headers
+        .get("build.bazel.remote.execution.v2.requestmetadata-bin")
+        .and_then(|v| base64::decode(v).ok())
+        .and_then(|v| RequestMetadata::decode(v.as_ref()).ok())
+}
+
+fn tracing_span(req: &http::Request<()>) -> Span {
+    if let Some(metadata) = extract_metadata(req.headers()) {
+        let metadata: RequestMetadata = metadata;
+        let tool = metadata
+            .tool_details
+            .as_ref()
+            .map(|tool_details| format!("{}/{}", tool_details.tool_name, tool_details.tool_version))
+            .unwrap_or_else(|| "unknown".into());
+        let invocation = metadata.tool_invocation_id;
+        span!(Level::INFO, "", tool = ?tool, invocation = ?invocation)
+    } else {
+        Span::none()
+    }
+}
+fn show_metadata(mut req: Request<()>) -> Result<Request<()>, Status> {
+    if let Some(metadata) = extract_metadata(req.metadata()) {
+        req.extensions_mut().insert(Arc::new(metadata));
+    } else {
+        let metadata = RequestMetadata {
+            tool_details: Some(ToolDetails {
+                tool_name: "unknown".into(),
+                tool_version: "0.0.0".into(),
+            }),
+            action_id: "".into(),
+            tool_invocation_id: "unknown".into(),
+            correlated_invocations_id: "unknown".into(),
+            action_mnemonic: "unknown".into(),
+            target_id: "unknown".into(),
+            configuration_id: "unknown".into(),
+        };
+        req.extensions_mut().insert(Arc::new(metadata));
+    }
+    Ok(req)
 }
 
 struct CASServer {
@@ -84,13 +151,24 @@ impl PlayCapabilities {
     }
 }
 
+fn get_metadata<T>(req: &Request<T>) -> Arc<RequestMetadata> {
+    req.extensions()
+        .get::<Arc<RequestMetadata>>()
+        .map(Arc::clone)
+        .unwrap()
+}
+
 #[async_trait]
 impl Capabilities for PlayCapabilities {
     async fn get_capabilities(
         &self,
         request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<ServerCapabilities>, Status> {
-        info!("Handling capabilities request");
+        let metadata = get_metadata(&request);
+        info!(
+            "Handling capabilities request for invocation {}",
+            metadata.tool_invocation_id
+        );
         if request.get_ref().instance_name
             == self
                 .inner

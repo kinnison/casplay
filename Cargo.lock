@@ -120,6 +120,7 @@ dependencies = [
  "anyhow",
  "async-recursion",
  "async-stream",
+ "base64",
  "bytes",
  "clap",
  "lazy_static",
