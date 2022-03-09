@@ -25,6 +25,7 @@ use prost::Message;
 use sha256::{digest_bytes, digest_file};
 use tokio::fs::{read_dir, read_link, File};
 use tokio::io::AsyncReadExt;
+use tracing::info;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about=None)]
@@ -84,7 +85,7 @@ async fn real_main() -> Crapshoot {
 
 async fn serve(config: &Config) -> Crapshoot {
     tracing_subscriber::fmt().init();
-
+    info!("Starting server on port 5000");
     casplay::server::serve(([0, 0, 0, 0], 5000).into(), &config.instance_name).await?;
     Ok(())
 }
@@ -197,6 +198,7 @@ async fn really_upload_blob(config: &Config, name: &Path) -> anyhow::Result<Dige
     })
 }
 
+#[allow(dead_code)]
 async fn has_blob(config: &Config, sha: &str, flen: u64) -> anyhow::Result<bool> {
     let mut client = ContentAddressableStorageClient::connect(config.endpoint.clone()).await?;
     let request = FindMissingBlobsRequest {

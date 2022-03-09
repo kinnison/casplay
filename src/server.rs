@@ -14,6 +14,7 @@ use prost::Message;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{async_trait, transport::Server, Code, Request, Response, Status, Streaming};
+use tracing::{info, trace};
 
 use crate::{
     build::bazel::{
@@ -89,6 +90,7 @@ impl Capabilities for PlayCapabilities {
         &self,
         request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<ServerCapabilities>, Status> {
+        info!("Handling capabilities request");
         if request.get_ref().instance_name
             == self
                 .inner
@@ -157,7 +159,7 @@ impl PlayByteStream {
             Some('/') => &resource_name[1..],
             _ => resource_name,
         };
-        println!("Extracting digest from '{}'", resource_name);
+        trace!("Extracting digest from '{}'", resource_name);
         let parts = match if is_write {
             WRITE_RESOURCE_PARTS.captures(resource_name)
         } else {
@@ -192,7 +194,7 @@ impl ByteStream for PlayByteStream {
 
     async fn query_write_status(
         &self,
-        request: Request<QueryWriteStatusRequest>,
+        _request: Request<QueryWriteStatusRequest>,
     ) -> Result<Response<QueryWriteStatusResponse>, Status> {
         todo!()
     }
@@ -209,7 +211,7 @@ impl ByteStream for PlayByteStream {
 
         let digest = self.extract_digest(&firstmsg.resource_name, true)?;
 
-        println!("Receiving a digest: {:?}", digest);
+        info!("Handling write for: {:?}", digest);
 
         if digest.size_bytes > 512 * 1024 * 1024 {
             return Err(Status::new(
@@ -240,7 +242,7 @@ impl ByteStream for PlayByteStream {
 
         // At this point we have a Digest, and a Vec of bytes, let's put it into the server.
 
-        println!("Inserting {}/{} into map", digest.hash, digest.size_bytes);
+        trace!("Inserting {}/{} into map", digest.hash, digest.size_bytes);
 
         let response = WriteResponse {
             committed_size: digest.size_bytes,
@@ -273,6 +275,11 @@ impl ByteStream for PlayByteStream {
         }
 
         let to_send = min(data.len() - offset, limit);
+
+        info!(
+            "Handling read of {} bytes starting at {} for {:?}",
+            to_send, offset, digest
+        );
 
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
@@ -334,8 +341,9 @@ impl ContentAddressableStorage for PlayCASServer {
 
     async fn find_missing_blobs(
         &self,
-        request: Request<FindMissingBlobsRequest>,
+        _request: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
+        info!("Find missing blobs - unimplemented");
         Err(Status::new(Code::Unimplemented, "not implemented"))
     }
 
@@ -349,10 +357,15 @@ impl ContentAddressableStorage for PlayCASServer {
 
         let mut response = BatchUpdateBlobsResponse { responses: vec![] };
 
+        info!(
+            "Handling batch update blobs ({} updates)",
+            request.get_ref().requests.len()
+        );
+
         for request in request.into_inner().requests {
             let data = request.data.into();
             let digest = request.digest.unwrap();
-            println!("Batch: Inserting {:?}", digest);
+            trace!("Batch: Inserting {:?}", digest);
             self.server()?.content.insert(digest.clone(), data);
             let entry = batch_update_blobs_response::Response {
                 digest: Some(digest),
@@ -370,7 +383,7 @@ impl ContentAddressableStorage for PlayCASServer {
 
     async fn batch_read_blobs(
         &self,
-        request: Request<BatchReadBlobsRequest>,
+        _request: Request<BatchReadBlobsRequest>,
     ) -> Result<Response<BatchReadBlobsResponse>, Status> {
         Err(Status::new(Code::Unimplemented, "not implemented"))
     }
@@ -385,10 +398,10 @@ impl ContentAddressableStorage for PlayCASServer {
 
         let root_digest = request.into_inner().root_digest.unwrap();
 
-        let root_data = match self.server()?.content.get(&root_digest).map(Arc::clone) {
-            Some(data) => data,
-            None => return Err(Status::new(Code::NotFound, "Unknown root digest")),
-        };
+        if !self.server()?.content.contains_key(&root_digest) {
+            return Err(Status::new(Code::NotFound, "Unknown root digest"));
+        }
+        info!("Retrieving tree for {:?}", root_digest);
 
         let (tx, rx) = mpsc::channel(4);
 
