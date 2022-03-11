@@ -28,8 +28,9 @@ use crate::{
     build::bazel::{
         remote::execution::v2::{
             action_cache_server::{ActionCache, ActionCacheServer},
-            batch_update_blobs_response,
+            batch_read_blobs_response, batch_update_blobs_response,
             capabilities_server::{Capabilities, CapabilitiesServer},
+            compressor,
             content_addressable_storage_server::{
                 ContentAddressableStorage, ContentAddressableStorageServer,
             },
@@ -52,6 +53,7 @@ use crate::{
     },
 };
 
+const MAX_BATCH_BYTES: i64 = 4193280;
 pub async fn serve(dst: SocketAddr, instance_name: &str) -> anyhow::Result<()> {
     let server = Arc::new(Mutex::new(CASServer::new(instance_name)));
     Server::builder()
@@ -200,7 +202,7 @@ impl Capabilities for PlayCapabilities {
                         update_enabled: true,
                     }),
                     cache_priority_capabilities: None,
-                    max_batch_total_size_bytes: 4193280,
+                    max_batch_total_size_bytes: MAX_BATCH_BYTES,
                     symlink_absolute_path_strategy:
                         symlink_absolute_path_strategy::Value::Disallowed as i32,
                     supported_compressors: vec![],
@@ -514,9 +516,55 @@ impl ContentAddressableStorage for PlayCASServer {
 
     async fn batch_read_blobs(
         &self,
-        _request: Request<BatchReadBlobsRequest>,
+        request: Request<BatchReadBlobsRequest>,
     ) -> Result<Response<BatchReadBlobsResponse>, Status> {
-        Err(Status::new(Code::Unimplemented, "not implemented"))
+        if request.get_ref().instance_name != self.server()?.instance_name {
+            return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
+        }
+
+        let request = request.into_inner();
+        info!("batch_read_blobs({} items)", request.digests.len());
+        let mut response = BatchReadBlobsResponse { responses: vec![] };
+
+        let mut total_read = 0;
+        for digest in request.digests {
+            if let Some(data) = self.server()?.content.get(&digest).map(Arc::clone) {
+                total_read += data.len();
+                response
+                    .responses
+                    .push(batch_read_blobs_response::Response {
+                        digest: Some(digest),
+                        data: data.to_vec(),
+                        compressor: compressor::Value::Identity as i32,
+                        status: Some(rpc::Status {
+                            code: rpc::Code::Ok as i32,
+                            message: "".into(),
+                            details: vec![],
+                        }),
+                    });
+            } else {
+                response
+                    .responses
+                    .push(batch_read_blobs_response::Response {
+                        digest: Some(digest),
+                        data: vec![],
+                        compressor: compressor::Value::Identity as i32,
+                        status: Some(rpc::Status {
+                            code: rpc::Code::NotFound as i32,
+                            message: "not found".into(),
+                            details: vec![],
+                        }),
+                    });
+            }
+            if (total_read as i64) > MAX_BATCH_BYTES {
+                return Err(Status::new(
+                    Code::InvalidArgument,
+                    "Too much data requested",
+                ));
+            }
+        }
+
+        Ok(Response::new(response))
     }
 
     async fn get_tree(
