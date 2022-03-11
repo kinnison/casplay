@@ -338,6 +338,24 @@ impl ByteStream for PlayByteStream {
             ));
         }
 
+        let uploaded_digest = Digest {
+            hash: digest_bytes(&data),
+            size_bytes: data.len() as i64,
+        };
+
+        if uploaded_digest != digest {
+            return Err(Status::new(
+                Code::InvalidArgument,
+                format!(
+                    "Uploaded data has digest {}/{} whereas upload said it would be {}/{}",
+                    uploaded_digest.hash,
+                    uploaded_digest.size_bytes,
+                    digest.hash,
+                    digest.size_bytes
+                ),
+            ));
+        }
+
         // At this point we have a Digest, and a Vec of bytes, let's put it into the server.
 
         trace!("Inserting {}/{} into map", digest.hash, digest.size_bytes);
