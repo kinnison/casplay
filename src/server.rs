@@ -11,6 +11,7 @@ use lazy_static::lazy_static;
 use regex::Regex;
 
 use prost::Message;
+use sha256::digest_bytes;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{
@@ -26,16 +27,18 @@ use tracing::{info, span, trace, Level, Span};
 use crate::{
     build::bazel::{
         remote::execution::v2::{
+            action_cache_server::{ActionCache, ActionCacheServer},
             batch_update_blobs_response,
             capabilities_server::{Capabilities, CapabilitiesServer},
             content_addressable_storage_server::{
                 ContentAddressableStorage, ContentAddressableStorageServer,
             },
-            digest_function, symlink_absolute_path_strategy, BatchReadBlobsRequest,
-            BatchReadBlobsResponse, BatchUpdateBlobsRequest, BatchUpdateBlobsResponse,
-            CacheCapabilities, Digest, Directory, FindMissingBlobsRequest,
-            FindMissingBlobsResponse, GetCapabilitiesRequest, GetTreeRequest, GetTreeResponse,
-            RequestMetadata, ServerCapabilities, ToolDetails,
+            digest_function, symlink_absolute_path_strategy, ActionCacheUpdateCapabilities,
+            ActionResult, BatchReadBlobsRequest, BatchReadBlobsResponse, BatchUpdateBlobsRequest,
+            BatchUpdateBlobsResponse, CacheCapabilities, Digest, Directory,
+            FindMissingBlobsRequest, FindMissingBlobsResponse, GetActionResultRequest,
+            GetCapabilitiesRequest, GetTreeRequest, GetTreeResponse, RequestMetadata,
+            ServerCapabilities, ToolDetails, Tree, UpdateActionResultRequest,
         },
         semver::SemVer,
     },
@@ -63,6 +66,9 @@ pub async fn serve(dst: SocketAddr, instance_name: &str) -> anyhow::Result<()> {
         .add_service(ContentAddressableStorageServer::new(PlayCASServer::new(
             Arc::clone(&server),
         )))
+        .add_service(ActionCacheServer::new(PlayActionCache::new(Arc::clone(
+            &server,
+        ))))
         .serve(dst)
         .await?;
 
@@ -130,14 +136,25 @@ fn show_metadata(mut req: Request<()>) -> Result<Request<()>, Status> {
 struct CASServer {
     instance_name: String,
     content: HashMap<Digest, Arc<[u8]>>,
+    actions: HashMap<Digest, Digest>,
 }
 
 impl CASServer {
     fn new(instance_name: &str) -> Self {
-        Self {
+        let mut ret = Self {
             instance_name: instance_name.to_string(),
             content: HashMap::new(),
-        }
+            actions: HashMap::new(),
+        };
+        // Preload the CAS with the empty blob because Bazel assumes we always have it.
+        ret.content.insert(
+            Digest {
+                hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+                size_bytes: 0,
+            },
+            vec![].into(),
+        );
+        ret
     }
 }
 
@@ -179,7 +196,9 @@ impl Capabilities for PlayCapabilities {
             Ok(Response::new(ServerCapabilities {
                 cache_capabilities: Some(CacheCapabilities {
                     digest_functions: vec![digest_function::Value::Sha256 as i32],
-                    action_cache_update_capabilities: None,
+                    action_cache_update_capabilities: Some(ActionCacheUpdateCapabilities {
+                        update_enabled: true,
+                    }),
                     cache_priority_capabilities: None,
                     max_batch_total_size_bytes: 4193280,
                     symlink_absolute_path_strategy:
@@ -272,9 +291,10 @@ impl ByteStream for PlayByteStream {
 
     async fn query_write_status(
         &self,
-        _request: Request<QueryWriteStatusRequest>,
+        request: Request<QueryWriteStatusRequest>,
     ) -> Result<Response<QueryWriteStatusResponse>, Status> {
-        todo!()
+        let _digest = self.extract_digest(&request.get_ref().resource_name, true)?;
+        Err(Status::new(Code::NotFound, "We never have partial writes"))
     }
 
     async fn write(
@@ -419,10 +439,25 @@ impl ContentAddressableStorage for PlayCASServer {
 
     async fn find_missing_blobs(
         &self,
-        _request: Request<FindMissingBlobsRequest>,
+        request: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
-        info!("Find missing blobs - unimplemented");
-        Err(Status::new(Code::Unimplemented, "not implemented"))
+        if request.get_ref().instance_name != self.server()?.instance_name {
+            return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
+        }
+
+        let request = request.into_inner();
+        let mut response = FindMissingBlobsResponse {
+            missing_blob_digests: vec![],
+        };
+
+        let inner = self.server()?;
+        for digest in request.blob_digests {
+            if !inner.content.contains_key(&digest) {
+                response.missing_blob_digests.push(digest);
+            }
+        }
+
+        Ok(Response::new(response))
     }
 
     async fn batch_update_blobs(
@@ -525,5 +560,184 @@ impl ContentAddressableStorage for PlayCASServer {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+struct PlayActionCache {
+    inner: Arc<Mutex<CASServer>>,
+}
+
+impl PlayActionCache {
+    fn new(inner: Arc<Mutex<CASServer>>) -> Self {
+        Self { inner }
+    }
+
+    fn server(&self) -> Result<MutexGuard<CASServer>, Status> {
+        self.inner
+            .lock()
+            .map_err(|_| Status::new(Code::Unknown, "Mutex poisoned?"))
+    }
+
+    fn validate_result(server: &CASServer, result: &ActionResult) -> bool {
+        for file in result.output_files.iter() {
+            let digest = file.digest.as_ref().unwrap();
+            if !server.content.contains_key(digest) {
+                // file didn't exist
+                info!(
+                    "Failed to find digest {}/{} for file {}",
+                    digest.hash, digest.size_bytes, file.path
+                );
+                return false;
+            }
+        }
+        for dir in result.output_directories.iter() {
+            let tree = dir.tree_digest.as_ref().unwrap();
+            if let Some(tree) = server.content.get(tree).map(Arc::clone) {
+                if let Ok(tree) = Tree::decode(tree.as_ref()) {
+                    let tree: Tree = tree;
+                    for dir in tree.children.iter().chain(tree.root.as_ref()) {
+                        for filenode in dir.files.iter() {
+                            let digest = filenode.digest.as_ref().unwrap();
+                            if !server.content.contains_key(digest) {
+                                // filenode wasn't found
+                                info!(
+                                    "Failed to find digest {}/{} for nested filenode {}",
+                                    digest.hash, digest.size_bytes, filenode.name
+                                );
+                                return false;
+                            }
+                        }
+                        for dirnode in dir.directories.iter() {
+                            let digest = dirnode.digest.as_ref().unwrap();
+                            if !server.content.contains_key(digest) {
+                                // dirnode wasn't found
+                                info!(
+                                    "Failed to find digest {}/{} for nested directorynode {}",
+                                    digest.hash, digest.size_bytes, dirnode.name
+                                );
+                                return false;
+                            }
+                        }
+                    }
+                } else {
+                    // tree didn't decode
+                    info!("Tree did not decode");
+                    return false;
+                }
+            } else {
+                // tree didn't exist
+                info!("Tree didn't exist");
+                return false;
+            }
+        }
+
+        if let Some(digest) = result.stdout_digest.as_ref() {
+            if !digest.hash.is_empty() && !server.content.contains_key(digest) {
+                // stdout is missing
+                info!("stdout missing: {}/{}", digest.hash, digest.size_bytes);
+                return false;
+            }
+        }
+
+        if let Some(digest) = result.stderr_digest.as_ref() {
+            if !digest.hash.is_empty() && !server.content.contains_key(digest) {
+                // stderr is missing
+                info!("stderr missing: {}/{}", digest.hash, digest.size_bytes);
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+#[async_trait]
+impl ActionCache for PlayActionCache {
+    async fn get_action_result(
+        &self,
+        request: Request<GetActionResultRequest>,
+    ) -> Result<Response<ActionResult>, Status> {
+        if request.get_ref().instance_name != self.server()?.instance_name {
+            return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
+        }
+
+        let request = request.into_inner();
+        let action_digest = request.action_digest.as_ref().map(Digest::clone).unwrap();
+        info!(
+            "get_action_result({}/{})",
+            action_digest.hash, action_digest.size_bytes
+        );
+        let server = self.server()?;
+        if let Some(result_digest) = server.actions.get(&action_digest) {
+            if let Some(result_data) = server.content.get(result_digest).map(Arc::clone) {
+                let result = ActionResult::decode(result_data.as_ref()).map_err(|e| {
+                    Status::new(
+                        Code::Internal,
+                        format!(
+                            "{}/{} action result does not decode: {:?}",
+                            result_digest.hash, result_digest.size_bytes, e
+                        ),
+                    )
+                })?;
+                info!("Success, we found a result");
+                if Self::validate_result(&server, &result) {
+                    Ok(Response::new(result))
+                } else {
+                    info!("Something was missing when validating action result");
+                    Err(Status::new(
+                        Code::NotFound,
+                        "Action result references something not present in the CAS",
+                    ))
+                }
+            } else {
+                Err(Status::new(
+                    Code::NotFound,
+                    format!(
+                        "{}/{} exists in action cache but not in CAS",
+                        action_digest.hash, action_digest.size_bytes
+                    ),
+                ))
+            }
+        } else {
+            Err(Status::new(
+                Code::NotFound,
+                format!(
+                    "{}/{} not found in action cache",
+                    action_digest.hash, action_digest.size_bytes
+                ),
+            ))
+        }
+    }
+
+    async fn update_action_result(
+        &self,
+        request: Request<UpdateActionResultRequest>,
+    ) -> Result<Response<ActionResult>, Status> {
+        if request.get_ref().instance_name != self.server()?.instance_name {
+            return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
+        }
+
+        let request = request.into_inner();
+        let action_digest = request.action_digest.as_ref().map(Digest::clone).unwrap();
+        info!("update_action_result({:?})", action_digest);
+
+        let result_bin: Vec<u8> = request.action_result.as_ref().unwrap().encode_to_vec();
+        let result_digest = Digest {
+            hash: digest_bytes(&result_bin),
+            size_bytes: result_bin.len() as i64,
+        };
+
+        self.server()?
+            .content
+            .insert(result_digest.clone(), result_bin.into());
+
+        self.server()?.actions.insert(action_digest, result_digest);
+
+        let result = request
+            .action_result
+            .as_ref()
+            .map(ActionResult::clone)
+            .unwrap();
+        Ok(Response::new(result))
     }
 }
