@@ -34,3 +34,5 @@ pub mod uploader;
 pub use uploader::Uploader;
 
 pub mod server;
+
+pub mod storage;
