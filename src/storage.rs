@@ -125,6 +125,7 @@ pub trait StorageBackend: Send + Sync {
 
 pub type StorageBackendInstance = Box<dyn StorageBackend>;
 
+pub mod disk;
 pub mod memory;
 
 #[async_trait]
