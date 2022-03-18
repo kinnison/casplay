@@ -45,7 +45,13 @@ enum Command {
     Fetch { name: String },
     Upload { name: PathBuf },
     Ls { name: String },
-    Serve,
+    Serve(ServerData),
+}
+
+#[derive(Parser, Debug)]
+struct ServerData {
+    #[clap(long)]
+    base: Option<PathBuf>,
 }
 
 type Crapshoot = anyhow::Result<()>;
@@ -77,16 +83,16 @@ async fn real_main() -> Crapshoot {
         Command::Fetch { name } => fetch_blob(&config, &name).await?,
         Command::Upload { name } => upload_blob(&config, &name).await?,
         Command::Ls { name } => list_tree(&config, &name).await?,
-        Command::Serve => serve(&config).await?,
+        Command::Serve(servedata) => serve(&config, servedata.base.as_deref()).await?,
     };
 
     Ok(())
 }
 
-async fn serve(config: &Config) -> Crapshoot {
+async fn serve(config: &Config, base: Option<&Path>) -> Crapshoot {
     tracing_subscriber::fmt().init();
     info!("Starting server on port 5000");
-    casplay::server::serve(([0, 0, 0, 0], 5000).into(), &config.instance_name).await?;
+    casplay::server::serve(([0, 0, 0, 0], 5000).into(), &config.instance_name, base).await?;
     Ok(())
 }
 

@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
+    path::Path,
     sync::Arc,
 };
 
@@ -50,12 +51,19 @@ use crate::{
         },
         rpc,
     },
-    storage::{memory::MemoryStorage, StorageBackend, StorageBackendInstance},
+    storage::{disk::OnDiskStorage, memory::MemoryStorage, StorageBackend, StorageBackendInstance},
 };
 
 const MAX_BATCH_BYTES: i64 = 4193280;
-pub async fn serve(dst: SocketAddr, instance_name: &str) -> anyhow::Result<()> {
-    let storage = MemoryStorage::instantiate();
+pub async fn serve(
+    dst: SocketAddr,
+    instance_name: &str,
+    base: Option<&Path>,
+) -> anyhow::Result<()> {
+    let storage = match base {
+        None => MemoryStorage::instantiate(),
+        Some(path) => OnDiskStorage::instantiate(path)?,
+    };
     let server = Arc::new(Mutex::new(CASServer::new(instance_name, storage)));
     Server::builder()
         .trace_fn(tracing_span)
