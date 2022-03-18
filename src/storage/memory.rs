@@ -10,24 +10,24 @@ use tonic::{async_trait, Code, Status};
 use crate::build::bazel::remote::execution::v2::Digest;
 
 use super::{
-    ReadSessionInstance, ReadSessionStream, Result, StorageBackend, WriteSession,
-    WriteSessionInstance, WriteSessionStream,
+    ReadSessionInstance, ReadSessionStream, Result, StorageBackend, StorageBackendInstance,
+    WriteSession, WriteSessionInstance, WriteSessionStream,
 };
 
 pub struct MemoryStorage {
     content: Arc<Mutex<HashMap<Digest, Arc<[u8]>>>>,
 }
 
-impl Default for MemoryStorage {
-    fn default() -> Self {
+impl MemoryStorage {
+    pub fn instantiate() -> StorageBackendInstance {
         let empty_digest = Digest {
             hash: digest_bytes(&[]),
             size_bytes: 0,
         };
         let base_map = Some((empty_digest, vec![].into())).into_iter().collect();
-        Self {
+        Box::new(Self {
             content: Arc::new(Mutex::new(base_map)),
-        }
+        }) as StorageBackendInstance
     }
 }
 
@@ -117,14 +117,14 @@ mod test {
     use sha256::digest_bytes;
     use tokio_stream::StreamExt;
 
-    use crate::{build::bazel::remote::execution::v2::Digest, storage::StorageBackend};
+    use crate::build::bazel::remote::execution::v2::Digest;
 
     use super::super::Result;
     use super::MemoryStorage;
 
     #[tokio::test]
     async fn new_storage_has_empty_digest() -> Result<()> {
-        let memory = MemoryStorage::default();
+        let memory = MemoryStorage::instantiate();
         let empty_digest = Digest {
             hash: digest_bytes(&[]),
             size_bytes: 0,
@@ -135,7 +135,7 @@ mod test {
 
     #[tokio::test]
     async fn new_storage_doesnt_have_data() -> Result<()> {
-        let memory = MemoryStorage::default();
+        let memory = MemoryStorage::instantiate();
         let some_digest = Digest {
             hash: digest_bytes(b"hello"),
             size_bytes: 5,
@@ -146,7 +146,7 @@ mod test {
 
     #[tokio::test]
     async fn can_insert_data() -> Result<()> {
-        let memory = MemoryStorage::default();
+        let memory = MemoryStorage::instantiate();
         let some_digest = Digest {
             hash: digest_bytes(b"hello"),
             size_bytes: 5,
@@ -163,7 +163,7 @@ mod test {
 
     #[tokio::test]
     async fn can_retrieve_data() -> Result<()> {
-        let memory = MemoryStorage::default();
+        let memory = MemoryStorage::instantiate();
         let some_digest = Digest {
             hash: digest_bytes(b"hello"),
             size_bytes: 5,

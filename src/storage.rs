@@ -26,7 +26,7 @@ type ReadSessionInstance = Pin<Box<ReadSessionStream>>;
 type BoxedIterator<T> = Box<dyn Iterator<Item = T> + Send + Sync>;
 
 #[async_trait]
-pub trait StorageBackend {
+pub trait StorageBackend: Send + Sync {
     async fn start_write(&self, digest: &Digest) -> Result<WriteSessionInstance>;
 
     async fn start_read(&self, digest: &Digest) -> Result<Option<ReadSessionInstance>>;
@@ -94,6 +94,8 @@ pub trait StorageBackend {
     }
 }
 
+pub type StorageBackendInstance = Box<dyn StorageBackend>;
+
 pub mod memory;
 
 #[cfg(test)]
@@ -104,7 +106,7 @@ mod test {
 
     #[tokio::test]
     async fn check_missing_blobs() -> Result<()> {
-        let memory = memory::MemoryStorage::default();
+        let memory = memory::MemoryStorage::instantiate();
         let empty_digest = Digest {
             hash: digest_bytes(b""),
             size_bytes: 0,
@@ -124,7 +126,7 @@ mod test {
 
     #[tokio::test]
     async fn batch_update_blobs() -> Result<()> {
-        let memory = memory::MemoryStorage::default();
+        let memory = memory::MemoryStorage::instantiate();
         let hello_digest = Digest {
             hash: digest_bytes(b"hello"),
             size_bytes: 5,
@@ -144,7 +146,7 @@ mod test {
 
     #[tokio::test]
     async fn batch_read_blobs() -> Result<()> {
-        let memory = memory::MemoryStorage::default();
+        let memory = memory::MemoryStorage::instantiate();
         let hello_digest = Digest {
             hash: digest_bytes(b"hello"),
             size_bytes: 5,
