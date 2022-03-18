@@ -1,10 +1,9 @@
 //! CASPlay server
 
 use std::{
-    cmp::min,
     collections::{HashMap, VecDeque},
     net::SocketAddr,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::Arc,
 };
 
 use lazy_static::lazy_static;
@@ -12,8 +11,8 @@ use regex::Regex;
 
 use prost::Message;
 use sha256::digest_bytes;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::{mpsc, Mutex, MutexGuard};
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{
     async_trait,
     codegen::http::{self, HeaderMap},
@@ -51,11 +50,13 @@ use crate::{
         },
         rpc,
     },
+    storage::{memory::MemoryStorage, StorageBackend, StorageBackendInstance},
 };
 
 const MAX_BATCH_BYTES: i64 = 4193280;
 pub async fn serve(dst: SocketAddr, instance_name: &str) -> anyhow::Result<()> {
-    let server = Arc::new(Mutex::new(CASServer::new(instance_name)));
+    let storage = MemoryStorage::instantiate();
+    let server = Arc::new(Mutex::new(CASServer::new(instance_name, storage)));
     Server::builder()
         .trace_fn(tracing_span)
         .layer(interceptor(show_metadata))
@@ -137,26 +138,17 @@ fn show_metadata(mut req: Request<()>) -> Result<Request<()>, Status> {
 
 struct CASServer {
     instance_name: String,
-    content: HashMap<Digest, Arc<[u8]>>,
+    storage: StorageBackendInstance,
     actions: HashMap<Digest, Digest>,
 }
 
 impl CASServer {
-    fn new(instance_name: &str) -> Self {
-        let mut ret = Self {
+    fn new(instance_name: &str, storage: StorageBackendInstance) -> Self {
+        Self {
             instance_name: instance_name.to_string(),
-            content: HashMap::new(),
+            storage,
             actions: HashMap::new(),
-        };
-        // Preload the CAS with the empty blob because Bazel assumes we always have it.
-        ret.content.insert(
-            Digest {
-                hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
-                size_bytes: 0,
-            },
-            vec![].into(),
-        );
-        ret
+        }
     }
 }
 
@@ -188,13 +180,7 @@ impl Capabilities for PlayCapabilities {
             "Handling capabilities request for invocation {}",
             metadata.tool_invocation_id
         );
-        if request.get_ref().instance_name
-            == self
-                .inner
-                .lock()
-                .map_err(|_| Status::new(Code::Unknown, "Mutex go boom"))?
-                .instance_name
-        {
+        if request.get_ref().instance_name == self.inner.lock().await.instance_name {
             Ok(Response::new(ServerCapabilities {
                 cache_capabilities: Some(CacheCapabilities {
                     digest_functions: vec![digest_function::Value::Sha256 as i32],
@@ -247,13 +233,11 @@ impl PlayByteStream {
     fn new(inner: Arc<Mutex<CASServer>>) -> Self {
         Self { inner }
     }
-    fn server(&self) -> Result<MutexGuard<CASServer>, Status> {
-        self.inner
-            .lock()
-            .map_err(|_| Status::new(Code::Unknown, "Mutex poisoned?"))
+    async fn server(&self) -> MutexGuard<'_, CASServer> {
+        self.inner.lock().await
     }
 
-    fn extract_digest(&self, resource_name: &str, is_write: bool) -> Result<Digest, Status> {
+    async fn extract_digest(&self, resource_name: &str, is_write: bool) -> Result<Digest, Status> {
         let resource_name = match resource_name.chars().next() {
             Some('/') => &resource_name[1..],
             _ => resource_name,
@@ -269,7 +253,7 @@ impl PlayByteStream {
         };
 
         let instance_name = parts.get(1).map(|m| m.as_str()).unwrap_or("");
-        if self.server()?.instance_name != instance_name {
+        if self.server().await.instance_name != instance_name {
             return Err(Status::new(
                 Code::InvalidArgument,
                 format!("Unknown instance: '{}'", instance_name),
@@ -295,7 +279,9 @@ impl ByteStream for PlayByteStream {
         &self,
         request: Request<QueryWriteStatusRequest>,
     ) -> Result<Response<QueryWriteStatusResponse>, Status> {
-        let _digest = self.extract_digest(&request.get_ref().resource_name, true)?;
+        let _digest = self
+            .extract_digest(&request.get_ref().resource_name, true)
+            .await?;
         Err(Status::new(Code::NotFound, "We never have partial writes"))
     }
 
@@ -309,7 +295,7 @@ impl ByteStream for PlayByteStream {
             None => return Err(Status::new(Code::InvalidArgument, "No write messages?")),
         };
 
-        let digest = self.extract_digest(&firstmsg.resource_name, true)?;
+        let digest = self.extract_digest(&firstmsg.resource_name, true).await?;
 
         info!("Handling write for: {:?}", digest);
 
@@ -320,15 +306,16 @@ impl ByteStream for PlayByteStream {
             ));
         }
 
-        let mut data: Vec<u8> = Vec::with_capacity(digest.size_bytes as usize);
+        let server = self.server().await;
+        let mut writer = server.storage.start_write(&digest).await?;
 
-        data.extend_from_slice(&firstmsg.data);
+        writer.write_block(&firstmsg.data).await?;
 
         let mut finish_write = firstmsg.finish_write;
 
         while let Some(msg) = wstream.message().await? {
             // Check the write_offset
-            data.extend_from_slice(&msg.data);
+            writer.write_block(&msg.data).await?;
             // Make sure the last chunk is a finish_write
             finish_write = msg.finish_write;
         }
@@ -340,10 +327,7 @@ impl ByteStream for PlayByteStream {
             ));
         }
 
-        let uploaded_digest = Digest {
-            hash: digest_bytes(&data),
-            size_bytes: data.len() as i64,
-        };
+        let uploaded_digest = writer.finish().await?;
 
         if uploaded_digest != digest {
             return Err(Status::new(
@@ -360,13 +344,11 @@ impl ByteStream for PlayByteStream {
 
         // At this point we have a Digest, and a Vec of bytes, let's put it into the server.
 
-        trace!("Inserting {}/{} into map", digest.hash, digest.size_bytes);
+        trace!("Inserted {}/{} into map", digest.hash, digest.size_bytes);
 
         let response = WriteResponse {
             committed_size: digest.size_bytes,
         };
-
-        self.server()?.content.insert(digest, data.into());
 
         Ok(Response::new(response))
     }
@@ -375,44 +357,31 @@ impl ByteStream for PlayByteStream {
         &self,
         request: Request<ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
-        let digest = self.extract_digest(&request.get_ref().resource_name, false)?;
-        let offset = request.get_ref().read_offset as usize;
-        let mut limit = request.get_ref().read_limit as usize;
+        let digest = self
+            .extract_digest(&request.get_ref().resource_name, false)
+            .await?;
+        let offset = request.get_ref().read_offset;
+        let limit = request.get_ref().read_limit;
 
-        let data = match self.server()?.content.get(&digest).map(Arc::clone) {
-            Some(data) => data,
-            None => return Err(Status::new(Code::NotFound, "not found")),
-        };
-
-        if offset >= data.len() {
-            return Err(Status::new(Code::InvalidArgument, "offset out of range"));
-        }
-
-        if limit == 0 {
-            limit = data.len()
-        }
-
-        let to_send = min(data.len() - offset, limit);
-
-        info!(
-            "Handling read of {} bytes starting at {} for {:?}",
-            to_send, offset, digest
-        );
+        let mut reader = self
+            .server()
+            .await
+            .storage
+            .start_read(&digest, offset, limit)
+            .await?;
 
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
-            let mut pos = offset;
-            let mut left = to_send;
-            while left > 0 {
-                let to_send = min(left, 1024);
-                let response = ReadResponse {
-                    data: data[pos..(pos + to_send)].to_vec(),
-                };
-                pos += to_send;
-                left -= to_send;
-                match tx.send(Ok(response)).await {
-                    Ok(_) => {}
-                    Err(_) => break,
+            while let Some(block) = reader.next().await {
+                match block {
+                    Ok(data) => {
+                        let msg = ReadResponse { data };
+                        tx.send(Ok(msg)).await.unwrap();
+                    }
+                    Err(e) => {
+                        tx.send(Err(e)).await.unwrap();
+                        break;
+                    }
                 }
             }
         });
@@ -430,19 +399,12 @@ impl PlayCASServer {
     fn new(inner: Arc<Mutex<CASServer>>) -> Self {
         Self { inner }
     }
-    fn server(&self) -> Result<MutexGuard<CASServer>, Status> {
-        self.inner
-            .lock()
-            .map_err(|_| Status::new(Code::Unknown, "Mutex poisoned?"))
+    async fn server(&self) -> MutexGuard<'_, CASServer> {
+        self.inner.lock().await
     }
 
-    fn get_dir(&self, digest: &Digest) -> Result<Directory, Status> {
-        let data = self
-            .server()?
-            .content
-            .get(digest)
-            .ok_or_else(|| Status::new(Code::NotFound, "unknown digest"))
-            .map(Arc::clone)?;
+    async fn get_dir(&self, digest: &Digest) -> Result<Directory, Status> {
+        let data = self.server().await.storage.read_blob(digest).await?;
         let dir: Directory = Directory::decode(data.as_ref()).map_err(|e| {
             Status::new(
                 Code::InvalidArgument,
@@ -450,6 +412,28 @@ impl PlayCASServer {
             )
         })?;
         Ok(dir)
+    }
+}
+
+fn rpc_code_for_status(status: Code) -> rpc::Code {
+    match status {
+        Code::Ok => rpc::Code::Ok,
+        Code::Cancelled => rpc::Code::Cancelled,
+        Code::Unknown => rpc::Code::Unknown,
+        Code::InvalidArgument => rpc::Code::InvalidArgument,
+        Code::DeadlineExceeded => rpc::Code::DeadlineExceeded,
+        Code::NotFound => rpc::Code::NotFound,
+        Code::AlreadyExists => rpc::Code::AlreadyExists,
+        Code::PermissionDenied => rpc::Code::PermissionDenied,
+        Code::ResourceExhausted => rpc::Code::ResourceExhausted,
+        Code::FailedPrecondition => rpc::Code::FailedPrecondition,
+        Code::Aborted => rpc::Code::Aborted,
+        Code::OutOfRange => rpc::Code::OutOfRange,
+        Code::Unimplemented => rpc::Code::Unimplemented,
+        Code::Internal => rpc::Code::Internal,
+        Code::Unavailable => rpc::Code::Unavailable,
+        Code::DataLoss => rpc::Code::DataLoss,
+        Code::Unauthenticated => rpc::Code::Unauthenticated,
     }
 }
 
@@ -461,21 +445,19 @@ impl ContentAddressableStorage for PlayCASServer {
         &self,
         request: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
-        if request.get_ref().instance_name != self.server()?.instance_name {
+        if request.get_ref().instance_name != self.server().await.instance_name {
             return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
         }
 
         let request = request.into_inner();
-        let mut response = FindMissingBlobsResponse {
-            missing_blob_digests: vec![],
+        let response = FindMissingBlobsResponse {
+            missing_blob_digests: self
+                .server()
+                .await
+                .storage
+                .find_missing_blobs(Box::new(request.blob_digests.into_iter()))
+                .await?,
         };
-
-        let inner = self.server()?;
-        for digest in request.blob_digests {
-            if !inner.content.contains_key(&digest) {
-                response.missing_blob_digests.push(digest);
-            }
-        }
 
         Ok(Response::new(response))
     }
@@ -484,32 +466,40 @@ impl ContentAddressableStorage for PlayCASServer {
         &self,
         request: Request<BatchUpdateBlobsRequest>,
     ) -> Result<Response<BatchUpdateBlobsResponse>, Status> {
-        if request.get_ref().instance_name != self.server()?.instance_name {
+        if request.get_ref().instance_name != self.server().await.instance_name {
             return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
         }
-
-        let mut response = BatchUpdateBlobsResponse { responses: vec![] };
 
         info!(
             "Handling batch update blobs ({} updates)",
             request.get_ref().requests.len()
         );
 
-        for request in request.into_inner().requests {
-            let data = request.data.into();
-            let digest = request.digest.unwrap();
-            trace!("Batch: Inserting {:?}", digest);
-            self.server()?.content.insert(digest.clone(), data);
-            let entry = batch_update_blobs_response::Response {
-                digest: Some(digest),
-                status: Some(rpc::Status {
-                    code: rpc::Code::Ok as i32,
-                    message: "".into(),
-                    details: vec![],
-                }),
-            };
-            response.responses.push(entry);
-        }
+        let update = request
+            .into_inner()
+            .requests
+            .into_iter()
+            .map(|r| (r.digest.unwrap(), r.data));
+        let update_result = self
+            .server()
+            .await
+            .storage
+            .batch_update_blobs(Box::new(update))
+            .await?;
+
+        let response = BatchUpdateBlobsResponse {
+            responses: update_result
+                .into_iter()
+                .map(|(digest, status)| batch_update_blobs_response::Response {
+                    digest: Some(digest),
+                    status: Some(rpc::Status {
+                        code: rpc_code_for_status(status.code()) as i32,
+                        message: "".into(),
+                        details: vec![],
+                    }),
+                })
+                .collect(),
+        };
 
         Ok(Response::new(response))
     }
@@ -518,51 +508,48 @@ impl ContentAddressableStorage for PlayCASServer {
         &self,
         request: Request<BatchReadBlobsRequest>,
     ) -> Result<Response<BatchReadBlobsResponse>, Status> {
-        if request.get_ref().instance_name != self.server()?.instance_name {
+        if request.get_ref().instance_name != self.server().await.instance_name {
             return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
         }
 
         let request = request.into_inner();
-        info!("batch_read_blobs({} items)", request.digests.len());
-        let mut response = BatchReadBlobsResponse { responses: vec![] };
 
-        let mut total_read = 0;
-        for digest in request.digests {
-            if let Some(data) = self.server()?.content.get(&digest).map(Arc::clone) {
-                total_read += data.len();
-                response
-                    .responses
-                    .push(batch_read_blobs_response::Response {
+        let total_bytes = request.digests.iter().map(|d| d.size_bytes).sum::<i64>();
+        if total_bytes > MAX_BATCH_BYTES {
+            return Err(Status::new(
+                Code::InvalidArgument,
+                "Too much data requested",
+            ));
+        }
+
+        let batchread = self
+            .server()
+            .await
+            .storage
+            .batch_read_blobs(Box::new(request.digests.into_iter()))
+            .await?;
+
+        let response = BatchReadBlobsResponse {
+            responses: batchread
+                .into_iter()
+                .map(|(digest, value)| {
+                    let (data, code) = match value {
+                        Ok(data) => (data, rpc::Code::Ok),
+                        Err(s) => (vec![], rpc_code_for_status(s.code())),
+                    };
+                    batch_read_blobs_response::Response {
                         digest: Some(digest),
-                        data: data.to_vec(),
+                        data,
                         compressor: compressor::Value::Identity as i32,
                         status: Some(rpc::Status {
-                            code: rpc::Code::Ok as i32,
+                            code: code as i32,
                             message: "".into(),
                             details: vec![],
                         }),
-                    });
-            } else {
-                response
-                    .responses
-                    .push(batch_read_blobs_response::Response {
-                        digest: Some(digest),
-                        data: vec![],
-                        compressor: compressor::Value::Identity as i32,
-                        status: Some(rpc::Status {
-                            code: rpc::Code::NotFound as i32,
-                            message: "not found".into(),
-                            details: vec![],
-                        }),
-                    });
-            }
-            if (total_read as i64) > MAX_BATCH_BYTES {
-                return Err(Status::new(
-                    Code::InvalidArgument,
-                    "Too much data requested",
-                ));
-            }
-        }
+                    }
+                })
+                .collect(),
+        };
 
         Ok(Response::new(response))
     }
@@ -571,13 +558,13 @@ impl ContentAddressableStorage for PlayCASServer {
         &self,
         request: Request<GetTreeRequest>,
     ) -> Result<Response<Self::GetTreeStream>, Status> {
-        if request.get_ref().instance_name != self.server()?.instance_name {
+        if request.get_ref().instance_name != self.server().await.instance_name {
             return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
         }
 
         let root_digest = request.into_inner().root_digest.unwrap();
 
-        if !self.server()?.content.contains_key(&root_digest) {
+        if !self.server().await.storage.contains(&root_digest).await? {
             return Err(Status::new(Code::NotFound, "Unknown root digest"));
         }
         info!("Retrieving tree for {:?}", root_digest);
@@ -587,7 +574,7 @@ impl ContentAddressableStorage for PlayCASServer {
         let server = self.clone();
 
         tokio::spawn(async move {
-            let root_dir: Directory = match server.get_dir(&root_digest) {
+            let root_dir: Directory = match server.get_dir(&root_digest).await {
                 Ok(d) => d,
                 Err(e) => {
                     tx.send(Err(e)).await.unwrap();
@@ -606,7 +593,7 @@ impl ContentAddressableStorage for PlayCASServer {
             }
 
             while let Some(next_digest) = to_send.pop_front() {
-                let dir = match server.get_dir(&next_digest) {
+                let dir = match server.get_dir(&next_digest).await {
                     Ok(d) => d,
                     Err(e) => {
                         tx.send(Err(e)).await.unwrap();
@@ -638,82 +625,78 @@ impl PlayActionCache {
         Self { inner }
     }
 
-    fn server(&self) -> Result<MutexGuard<CASServer>, Status> {
-        self.inner
-            .lock()
-            .map_err(|_| Status::new(Code::Unknown, "Mutex poisoned?"))
+    async fn server(&self) -> MutexGuard<'_, CASServer> {
+        self.inner.lock().await
     }
 
-    fn validate_result(server: &CASServer, result: &ActionResult) -> bool {
+    async fn validate_result(
+        storage: &dyn StorageBackend,
+        result: &ActionResult,
+    ) -> Result<bool, Status> {
         for file in result.output_files.iter() {
             let digest = file.digest.as_ref().unwrap();
-            if !server.content.contains_key(digest) {
+            if !storage.contains(digest).await? {
                 // file didn't exist
                 info!(
                     "Failed to find digest {}/{} for file {}",
                     digest.hash, digest.size_bytes, file.path
                 );
-                return false;
+                return Ok(false);
             }
         }
         for dir in result.output_directories.iter() {
             let tree = dir.tree_digest.as_ref().unwrap();
-            if let Some(tree) = server.content.get(tree).map(Arc::clone) {
-                if let Ok(tree) = Tree::decode(tree.as_ref()) {
-                    let tree: Tree = tree;
-                    for dir in tree.children.iter().chain(tree.root.as_ref()) {
-                        for filenode in dir.files.iter() {
-                            let digest = filenode.digest.as_ref().unwrap();
-                            if !server.content.contains_key(digest) {
-                                // filenode wasn't found
-                                info!(
-                                    "Failed to find digest {}/{} for nested filenode {}",
-                                    digest.hash, digest.size_bytes, filenode.name
-                                );
-                                return false;
-                            }
-                        }
-                        for dirnode in dir.directories.iter() {
-                            let digest = dirnode.digest.as_ref().unwrap();
-                            if !server.content.contains_key(digest) {
-                                // dirnode wasn't found
-                                info!(
-                                    "Failed to find digest {}/{} for nested directorynode {}",
-                                    digest.hash, digest.size_bytes, dirnode.name
-                                );
-                                return false;
-                            }
+            let tree = storage.read_blob(tree).await?;
+            if let Ok(tree) = Tree::decode(&tree[..]) {
+                let tree: Tree = tree;
+                for dir in tree.children.iter().chain(tree.root.as_ref()) {
+                    for filenode in dir.files.iter() {
+                        let digest = filenode.digest.as_ref().unwrap();
+                        if !storage.contains(digest).await? {
+                            // filenode wasn't found
+                            info!(
+                                "Failed to find digest {}/{} for nested filenode {}",
+                                digest.hash, digest.size_bytes, filenode.name
+                            );
+                            return Ok(false);
                         }
                     }
-                } else {
-                    // tree didn't decode
-                    info!("Tree did not decode");
-                    return false;
+                    for dirnode in dir.directories.iter() {
+                        let digest = dirnode.digest.as_ref().unwrap();
+                        if !storage.contains(digest).await? {
+                            // dirnode wasn't found
+                            info!(
+                                "Failed to find digest {}/{} for nested directorynode {}",
+                                digest.hash, digest.size_bytes, dirnode.name
+                            );
+                            return Ok(false);
+                        }
+                    }
                 }
             } else {
-                // tree didn't exist
-                info!("Tree didn't exist");
-                return false;
+                // tree didn't decode
+                info!("Tree did not decode");
+                return Ok(false);
             }
         }
 
         if let Some(digest) = result.stdout_digest.as_ref() {
-            if !digest.hash.is_empty() && !server.content.contains_key(digest) {
+            if !digest.hash.is_empty() && !storage.contains(digest).await? {
                 // stdout is missing
                 info!("stdout missing: {}/{}", digest.hash, digest.size_bytes);
-                return false;
+                return Ok(false);
             }
         }
 
         if let Some(digest) = result.stderr_digest.as_ref() {
-            if !digest.hash.is_empty() && !server.content.contains_key(digest) {
+            if !digest.hash.is_empty() && !storage.contains(digest).await? {
                 // stderr is missing
                 info!("stderr missing: {}/{}", digest.hash, digest.size_bytes);
-                return false;
+                return Ok(false);
             }
         }
 
-        true
+        Ok(true)
     }
 }
 
@@ -723,7 +706,7 @@ impl ActionCache for PlayActionCache {
         &self,
         request: Request<GetActionResultRequest>,
     ) -> Result<Response<ActionResult>, Status> {
-        if request.get_ref().instance_name != self.server()?.instance_name {
+        if request.get_ref().instance_name != self.server().await.instance_name {
             return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
         }
 
@@ -733,35 +716,26 @@ impl ActionCache for PlayActionCache {
             "get_action_result({}/{})",
             action_digest.hash, action_digest.size_bytes
         );
-        let server = self.server()?;
+        let server = self.server().await;
         if let Some(result_digest) = server.actions.get(&action_digest) {
-            if let Some(result_data) = server.content.get(result_digest).map(Arc::clone) {
-                let result = ActionResult::decode(result_data.as_ref()).map_err(|e| {
-                    Status::new(
-                        Code::Internal,
-                        format!(
-                            "{}/{} action result does not decode: {:?}",
-                            result_digest.hash, result_digest.size_bytes, e
-                        ),
-                    )
-                })?;
-                info!("Success, we found a result");
-                if Self::validate_result(&server, &result) {
-                    Ok(Response::new(result))
-                } else {
-                    info!("Something was missing when validating action result");
-                    Err(Status::new(
-                        Code::NotFound,
-                        "Action result references something not present in the CAS",
-                    ))
-                }
+            let result_data = server.storage.read_blob(result_digest).await?;
+            let result = ActionResult::decode(result_data.as_ref()).map_err(|e| {
+                Status::new(
+                    Code::Internal,
+                    format!(
+                        "{}/{} action result does not decode: {:?}",
+                        result_digest.hash, result_digest.size_bytes, e
+                    ),
+                )
+            })?;
+            info!("Success, we found a result");
+            if Self::validate_result(&server.storage, &result).await? {
+                Ok(Response::new(result))
             } else {
+                info!("Something was missing when validating action result");
                 Err(Status::new(
                     Code::NotFound,
-                    format!(
-                        "{}/{} exists in action cache but not in CAS",
-                        action_digest.hash, action_digest.size_bytes
-                    ),
+                    "Action result references something not present in the CAS",
                 ))
             }
         } else {
@@ -779,7 +753,7 @@ impl ActionCache for PlayActionCache {
         &self,
         request: Request<UpdateActionResultRequest>,
     ) -> Result<Response<ActionResult>, Status> {
-        if request.get_ref().instance_name != self.server()?.instance_name {
+        if request.get_ref().instance_name != self.server().await.instance_name {
             return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
         }
 
@@ -793,11 +767,16 @@ impl ActionCache for PlayActionCache {
             size_bytes: result_bin.len() as i64,
         };
 
-        self.server()?
-            .content
-            .insert(result_digest.clone(), result_bin.into());
+        self.server()
+            .await
+            .storage
+            .write_blob(&result_digest, &result_bin)
+            .await?;
 
-        self.server()?.actions.insert(action_digest, result_digest);
+        self.server()
+            .await
+            .actions
+            .insert(action_digest, result_digest);
 
         let result = request
             .action_result
