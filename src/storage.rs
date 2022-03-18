@@ -12,7 +12,7 @@ type Result<T, E = Status> = std::result::Result<T, E>;
 
 #[async_trait]
 pub trait WriteSession {
-    async fn write_block(&mut self, block: Vec<u8>) -> Result<()>;
+    async fn write_block(&mut self, block: &[u8]) -> Result<()>;
 
     async fn finish(&mut self) -> Result<Digest>;
 }
@@ -29,9 +29,42 @@ type BoxedIterator<T> = Box<dyn Iterator<Item = T> + Send + Sync>;
 pub trait StorageBackend: Send + Sync {
     async fn start_write(&self, digest: &Digest) -> Result<WriteSessionInstance>;
 
-    async fn start_read(&self, digest: &Digest) -> Result<Option<ReadSessionInstance>>;
+    async fn start_read(
+        &self,
+        digest: &Digest,
+        offset: i64,
+        limit: i64,
+    ) -> Result<ReadSessionInstance>;
 
     async fn contains(&self, digest: &Digest) -> Result<bool>;
+
+    // The following have default impls which are naive but work
+
+    async fn read_blob(&self, digest: &Digest) -> Result<Vec<u8>> {
+        let mut ret = Vec::new();
+        let mut reader = self.start_read(digest, 0, 0).await?;
+
+        while let Some(block) = reader.next().await {
+            let data = block?;
+            ret.extend_from_slice(&data[..]);
+        }
+
+        Ok(ret)
+    }
+
+    async fn write_blob(&self, digest: &Digest, data: &[u8]) -> Result<Digest> {
+        let mut writer = self.start_write(digest).await?;
+        writer.write_block(data).await?;
+        let written = writer.finish().await?;
+        if &written != digest {
+            Err(Status::new(
+                Code::InvalidArgument,
+                "data does not match digest",
+            ))
+        } else {
+            Ok(written)
+        }
+    }
 
     async fn batch_update_blobs(
         &self,
@@ -40,7 +73,7 @@ pub trait StorageBackend: Send + Sync {
         let mut ret = Vec::new();
         for (blob, data) in blobs {
             match self.start_write(&blob).await {
-                Ok(mut writer) => match writer.write_block(data).await {
+                Ok(mut writer) => match writer.write_block(&data).await {
                     Ok(_) => match writer.finish().await {
                         Ok(written) => {
                             if blob != written {
@@ -68,17 +101,13 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<Vec<(Digest, Result<Vec<u8>>)>> {
         let mut ret = Vec::new();
         for blob in blobs {
-            match self.start_read(&blob).await? {
-                Some(mut reader) => {
-                    let mut data = Vec::new();
-                    while let Some(block) = reader.next().await {
-                        let block = block?;
-                        data.extend_from_slice(&block[..])
-                    }
-                    ret.push((blob, Ok(data)))
-                }
-                None => ret.push((blob, Err(Status::new(Code::NotFound, "not found")))),
+            let mut reader = self.start_read(&blob, 0, 0).await?;
+            let mut data = Vec::new();
+            while let Some(block) = reader.next().await {
+                let block = block?;
+                data.extend_from_slice(&block[..])
             }
+            ret.push((blob, Ok(data)))
         }
         Ok(ret)
     }
@@ -97,6 +126,26 @@ pub trait StorageBackend: Send + Sync {
 pub type StorageBackendInstance = Box<dyn StorageBackend>;
 
 pub mod memory;
+
+#[async_trait]
+impl StorageBackend for Box<dyn StorageBackend> {
+    async fn start_write(&self, digest: &Digest) -> Result<WriteSessionInstance> {
+        self.as_ref().start_write(digest).await
+    }
+
+    async fn start_read(
+        &self,
+        digest: &Digest,
+        offset: i64,
+        limit: i64,
+    ) -> Result<ReadSessionInstance> {
+        self.as_ref().start_read(digest, offset, limit).await
+    }
+
+    async fn contains(&self, digest: &Digest) -> Result<bool> {
+        self.as_ref().contains(digest).await
+    }
+}
 
 #[cfg(test)]
 mod test {
@@ -152,7 +201,7 @@ mod test {
             size_bytes: 5,
         };
         let mut writer = memory.start_write(&hello_digest).await?;
-        writer.write_block(b"hello".to_vec()).await?;
+        writer.write_block(b"hello").await?;
         assert_eq!(writer.finish().await?, hello_digest);
         let wanted = vec![hello_digest.clone()];
         let output = memory
@@ -164,6 +213,34 @@ mod test {
             assert!(content.is_ok());
             assert_eq!(&content.unwrap(), b"hello");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_blob() -> Result<()> {
+        let memory = memory::MemoryStorage::instantiate();
+        let hello_digest = Digest {
+            hash: digest_bytes(b"hello"),
+            size_bytes: 5,
+        };
+        let mut writer = memory.start_write(&hello_digest).await?;
+        writer.write_block(b"hello").await?;
+        assert_eq!(writer.finish().await?, hello_digest);
+        let read_data = memory.read_blob(&hello_digest).await?;
+        assert_eq!(&read_data, b"hello");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_blob() -> Result<()> {
+        let memory = memory::MemoryStorage::instantiate();
+        let hello_digest = Digest {
+            hash: digest_bytes(b"hello"),
+            size_bytes: 5,
+        };
+        memory.write_blob(&hello_digest, b"hello").await?;
+        let read_data = memory.read_blob(&hello_digest).await?;
+        assert_eq!(&read_data, b"hello");
         Ok(())
     }
 }

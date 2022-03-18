@@ -41,8 +41,8 @@ struct MemoryStorageWriter {
 
 #[async_trait]
 impl WriteSession for MemoryStorageWriter {
-    async fn write_block(&mut self, block: Vec<u8>) -> Result<()> {
-        self.buffer.extend_from_slice(&block[..]);
+    async fn write_block(&mut self, block: &[u8]) -> Result<()> {
+        self.buffer.extend_from_slice(block);
         if self.buffer.len() > self.size {
             Err(Status::new(Code::InvalidArgument, "too much data provided"))
         } else {
@@ -82,29 +82,49 @@ impl StorageBackend for MemoryStorage {
         Ok((Box::new(writer) as Box<WriteSessionStream>).into())
     }
 
-    async fn start_read(&self, digest: &Digest) -> Result<Option<ReadSessionInstance>> {
-        Ok(self
-            .content
-            .lock()
-            .await
-            .get(digest)
-            .map(Arc::clone)
-            .map(|data| {
-                let (tx, rx) = mpsc::channel(4);
-                tokio::spawn(async move {
-                    let mut sent = 0;
-                    while sent < data.len() {
-                        let to_send = min(BLOCK_SIZE, data.len() - sent);
-                        if (tx.send(Ok(data[sent..(sent + to_send)].to_vec())).await).is_err() {
-                            // Failed to send, we may as well give up because the stream is broken somehow so
-                            // we can't signal that to the consumer anyway.
-                            break;
-                        }
-                        sent += to_send;
-                    }
-                });
-                (Box::new(ReceiverStream::new(rx)) as Box<ReadSessionStream>).into()
-            }))
+    async fn start_read(
+        &self,
+        digest: &Digest,
+        offset: i64,
+        mut limit: i64,
+    ) -> Result<ReadSessionInstance> {
+        let data = match self.content.lock().await.get(digest).map(Arc::clone) {
+            Some(data) => data,
+            None => return Err(Status::new(Code::NotFound, "not found")),
+        };
+        if offset >= data.len() as i64 {
+            return Err(Status::new(Code::InvalidArgument, "offset out of range"));
+        }
+
+        if limit == 0 {
+            limit = data.len() as i64
+        }
+
+        let to_send = min((data.len() as i64) - offset, limit);
+
+        let (tx, rx) = mpsc::channel(4);
+
+        let offset = offset as usize;
+        let to_send = to_send as usize;
+
+        tokio::spawn(async move {
+            let mut sent = 0;
+            while sent < to_send {
+                let to_send = min(BLOCK_SIZE, to_send - sent);
+                if (tx
+                    .send(Ok(data[offset + sent..(offset + sent + to_send)].to_vec()))
+                    .await)
+                    .is_err()
+                {
+                    // Failed to send, we may as well give up because the stream is broken somehow so
+                    // we can't signal that to the consumer anyway.
+                    break;
+                }
+                sent += to_send;
+            }
+        });
+
+        Ok((Box::new(ReceiverStream::new(rx)) as Box<ReadSessionStream>).into())
     }
 
     async fn contains(&self, digest: &Digest) -> Result<bool> {
@@ -152,9 +172,7 @@ mod test {
             size_bytes: 5,
         };
         let mut writer = memory.start_write(&some_digest).await?;
-        writer
-            .write_block(vec![b'h', b'e', b'l', b'l', b'o'])
-            .await?;
+        writer.write_block(b"hello").await?;
         let written = writer.finish().await?;
         assert_eq!(some_digest, written);
         assert!(memory.contains(&some_digest).await?);
@@ -169,15 +187,10 @@ mod test {
             size_bytes: 5,
         };
         let mut writer = memory.start_write(&some_digest).await?;
-        writer
-            .write_block(vec![b'h', b'e', b'l', b'l', b'o'])
-            .await?;
+        writer.write_block(b"hello").await?;
         let written = writer.finish().await?;
         assert_eq!(some_digest, written);
-        let mut reader = memory
-            .start_read(&some_digest)
-            .await?
-            .expect("write failed?");
+        let mut reader = memory.start_read(&some_digest, 0, 0).await?;
         let mut accumulator = Vec::new();
         while let Some(data) = reader.next().await {
             let data = data?;
