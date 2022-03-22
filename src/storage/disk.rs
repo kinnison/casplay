@@ -10,14 +10,14 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::mpsc,
 };
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{async_trait, Code, Status};
 
 use crate::build::bazel::remote::execution::v2::Digest;
 
 use super::{
-    ReadSessionInstance, ReadSessionStream, Result, StorageBackend, WriteSession,
-    WriteSessionInstance, WriteSessionStream,
+    ReadSessionInstance, ReadSessionStream, Result, StorageBackend, StorageBackendInstance,
+    WriteSession, WriteSessionInstance, WriteSessionStream,
 };
 
 // On disk storage backend
@@ -94,6 +94,11 @@ impl WriteSession for OnDiskStorageWriter {
 
 #[async_trait]
 impl StorageBackend for OnDiskStorage {
+    async fn make_copy(&self) -> Result<StorageBackendInstance> {
+        Ok(Box::new(Self {
+            base: self.base.clone(),
+        }) as StorageBackendInstance)
+    }
     async fn start_write(&self, digest: &Digest) -> Result<WriteSessionInstance> {
         let writing = self.temp_path_for(digest);
         let target = self.path_for(digest);

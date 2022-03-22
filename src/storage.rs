@@ -27,6 +27,7 @@ type BoxedIterator<T> = Box<dyn Iterator<Item = T> + Send + Sync>;
 
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
+    async fn make_copy(&self) -> Result<StorageBackendInstance>;
     async fn start_write(&self, digest: &Digest) -> Result<WriteSessionInstance>;
 
     async fn start_read(
@@ -130,6 +131,9 @@ pub mod memory;
 
 #[async_trait]
 impl StorageBackend for Box<dyn StorageBackend> {
+    async fn make_copy(&self) -> Result<StorageBackendInstance> {
+        self.as_ref().make_copy().await
+    }
     async fn start_write(&self, digest: &Digest) -> Result<WriteSessionInstance> {
         self.as_ref().start_write(digest).await
     }
