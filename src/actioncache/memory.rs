@@ -36,7 +36,6 @@ impl ActionCacheStorage for MemoryActionStorage {
                 digest.hash, digest.size_bytes
             ))
         })?;
-        println!("OK, found result digest");
         self.storage.get_message(result_digest).await
     }
 

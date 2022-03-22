@@ -170,13 +170,7 @@ impl StorageBackendExt for Box<dyn StorageBackend> {
     where
         M: Message + Default,
     {
-        println!("Trying to retrieve {}/{}", digest.hash, digest.size_bytes);
         let body = self.read_blob(digest).await?;
-        println!(
-            "Read {} bytes, expected {} bytes",
-            body.len(),
-            digest.size_bytes
-        );
         Message::decode(body.as_ref()).map_err(|_| {
             Status::internal(format!(
                 "Unable to decode blob {}/{}",
@@ -194,7 +188,6 @@ impl StorageBackendExt for Box<dyn StorageBackend> {
             hash: digest_bytes(&body),
             size_bytes: body.len() as i64,
         };
-        println!("Storing {} bytes", body.len());
         self.write_blob(&digest, &body).await
     }
 }

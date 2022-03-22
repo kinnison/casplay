@@ -70,7 +70,6 @@ mod test {
                 },
             )
             .await?;
-        println!("Stored OK");
         let retrieved_result = action_storage.get_action_result(&action_digest).await?;
         assert_eq!(stored_result, retrieved_result);
         Ok(())
