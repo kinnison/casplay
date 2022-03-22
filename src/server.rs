@@ -6,7 +6,6 @@ use lazy_static::lazy_static;
 use regex::Regex;
 
 use prost::Message;
-use sha256::digest_bytes;
 use tokio::sync::{mpsc, Mutex, MutexGuard};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{
