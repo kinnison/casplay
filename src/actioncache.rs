@@ -18,7 +18,7 @@ pub trait ActionCacheStorage: Send + Sync {
     ) -> Result<ActionResult>;
 }
 
-type ActionCacheStorageInstance = Box<dyn ActionCacheStorage>;
+pub type ActionCacheStorageInstance = Box<dyn ActionCacheStorage>;
 
 #[async_trait]
 impl ActionCacheStorage for Box<dyn ActionCacheStorage> {
