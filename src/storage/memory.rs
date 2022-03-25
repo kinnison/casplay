@@ -73,6 +73,12 @@ impl WriteSession for MemoryStorageWriter {
 
 #[async_trait]
 impl StorageBackend for MemoryStorage {
+    async fn make_copy(&self) -> Result<StorageBackendInstance> {
+        Ok(Box::new(Self {
+            content: Arc::clone(&self.content),
+        }) as StorageBackendInstance)
+    }
+
     async fn start_write(&self, digest: &Digest) -> Result<WriteSessionInstance> {
         let writer = MemoryStorageWriter {
             size: digest.size_bytes as usize,
@@ -92,7 +98,7 @@ impl StorageBackend for MemoryStorage {
             Some(data) => data,
             None => return Err(Status::new(Code::NotFound, "not found")),
         };
-        if offset >= data.len() as i64 {
+        if offset > data.len() as i64 {
             return Err(Status::new(Code::InvalidArgument, "offset out of range"));
         }
 

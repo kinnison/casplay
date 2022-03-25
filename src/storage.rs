@@ -3,6 +3,8 @@
 
 use std::pin::Pin;
 
+use prost::Message;
+use sha256::digest_bytes;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{async_trait, Code, Status};
 
@@ -27,6 +29,7 @@ type BoxedIterator<T> = Box<dyn Iterator<Item = T> + Send + Sync>;
 
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
+    async fn make_copy(&self) -> Result<StorageBackendInstance>;
     async fn start_write(&self, digest: &Digest) -> Result<WriteSessionInstance>;
 
     async fn start_read(
@@ -123,6 +126,16 @@ pub trait StorageBackend: Send + Sync {
     }
 }
 
+#[async_trait]
+pub trait StorageBackendExt {
+    async fn get_message<M>(&self, digest: &Digest) -> Result<M>
+    where
+        M: Message + Default;
+    async fn store_message<M>(&self, message: &M) -> Result<Digest>
+    where
+        M: Message;
+}
+
 pub type StorageBackendInstance = Box<dyn StorageBackend>;
 
 pub mod disk;
@@ -130,6 +143,9 @@ pub mod memory;
 
 #[async_trait]
 impl StorageBackend for Box<dyn StorageBackend> {
+    async fn make_copy(&self) -> Result<StorageBackendInstance> {
+        self.as_ref().make_copy().await
+    }
     async fn start_write(&self, digest: &Digest) -> Result<WriteSessionInstance> {
         self.as_ref().start_write(digest).await
     }
@@ -145,6 +161,34 @@ impl StorageBackend for Box<dyn StorageBackend> {
 
     async fn contains(&self, digest: &Digest) -> Result<bool> {
         self.as_ref().contains(digest).await
+    }
+}
+
+#[async_trait]
+impl StorageBackendExt for Box<dyn StorageBackend> {
+    async fn get_message<M>(&self, digest: &Digest) -> Result<M>
+    where
+        M: Message + Default,
+    {
+        let body = self.read_blob(digest).await?;
+        Message::decode(body.as_ref()).map_err(|_| {
+            Status::internal(format!(
+                "Unable to decode blob {}/{}",
+                digest.hash, digest.size_bytes,
+            ))
+        })
+    }
+
+    async fn store_message<M>(&self, message: &M) -> Result<Digest>
+    where
+        M: Message,
+    {
+        let body = message.encode_to_vec();
+        let digest = Digest {
+            hash: digest_bytes(&body),
+            size_bytes: body.len() as i64,
+        };
+        self.write_blob(&digest, &body).await
     }
 }
 

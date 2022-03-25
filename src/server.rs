@@ -1,17 +1,11 @@
 //! CASPlay server
 
-use std::{
-    collections::{HashMap, VecDeque},
-    net::SocketAddr,
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::VecDeque, net::SocketAddr, path::Path, sync::Arc};
 
 use lazy_static::lazy_static;
 use regex::Regex;
 
 use prost::Message;
-use sha256::digest_bytes;
 use tokio::sync::{mpsc, Mutex, MutexGuard};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{
@@ -25,6 +19,7 @@ use tonic::{
 use tracing::{info, span, trace, Level, Span};
 
 use crate::{
+    actioncache::{memory::MemoryActionStorage, ActionCacheStorageInstance},
     build::bazel::{
         remote::execution::v2::{
             action_cache_server::{ActionCache, ActionCacheServer},
@@ -64,7 +59,12 @@ pub async fn serve(
         None => MemoryStorage::instantiate(),
         Some(path) => OnDiskStorage::instantiate(path)?,
     };
-    let server = Arc::new(Mutex::new(CASServer::new(instance_name, storage)));
+    let action_storage = MemoryActionStorage::instantiate(storage.make_copy().await?);
+    let server = Arc::new(Mutex::new(CASServer::new(
+        instance_name,
+        storage,
+        action_storage,
+    )));
     Server::builder()
         .trace_fn(tracing_span)
         .layer(interceptor(show_metadata))
@@ -147,15 +147,19 @@ fn show_metadata(mut req: Request<()>) -> Result<Request<()>, Status> {
 struct CASServer {
     instance_name: String,
     storage: StorageBackendInstance,
-    actions: HashMap<Digest, Digest>,
+    actions: ActionCacheStorageInstance,
 }
 
 impl CASServer {
-    fn new(instance_name: &str, storage: StorageBackendInstance) -> Self {
+    fn new(
+        instance_name: &str,
+        storage: StorageBackendInstance,
+        actions: ActionCacheStorageInstance,
+    ) -> Self {
         Self {
             instance_name: instance_name.to_string(),
             storage,
-            actions: HashMap::new(),
+            actions,
         }
     }
 }
@@ -725,34 +729,14 @@ impl ActionCache for PlayActionCache {
             action_digest.hash, action_digest.size_bytes
         );
         let server = self.server().await;
-        if let Some(result_digest) = server.actions.get(&action_digest) {
-            let result_data = server.storage.read_blob(result_digest).await?;
-            let result = ActionResult::decode(result_data.as_ref()).map_err(|e| {
-                Status::new(
-                    Code::Internal,
-                    format!(
-                        "{}/{} action result does not decode: {:?}",
-                        result_digest.hash, result_digest.size_bytes, e
-                    ),
-                )
-            })?;
-            info!("Success, we found a result");
-            if Self::validate_result(&server.storage, &result).await? {
-                Ok(Response::new(result))
-            } else {
-                info!("Something was missing when validating action result");
-                Err(Status::new(
-                    Code::NotFound,
-                    "Action result references something not present in the CAS",
-                ))
-            }
+        let result = server.actions.get_action_result(&action_digest).await?;
+        if Self::validate_result(&server.storage, &result).await? {
+            Ok(Response::new(result))
         } else {
+            info!("Something was missing when validating action result");
             Err(Status::new(
                 Code::NotFound,
-                format!(
-                    "{}/{} not found in action cache",
-                    action_digest.hash, action_digest.size_bytes
-                ),
+                "Action result references something not present in the CAS",
             ))
         }
     }
@@ -769,28 +753,14 @@ impl ActionCache for PlayActionCache {
         let action_digest = request.action_digest.as_ref().map(Digest::clone).unwrap();
         info!("update_action_result({:?})", action_digest);
 
-        let result_bin: Vec<u8> = request.action_result.as_ref().unwrap().encode_to_vec();
-        let result_digest = Digest {
-            hash: digest_bytes(&result_bin),
-            size_bytes: result_bin.len() as i64,
-        };
-
-        self.server()
-            .await
-            .storage
-            .write_blob(&result_digest, &result_bin)
-            .await?;
-
-        self.server()
+        let result = request.action_result.unwrap();
+        let result = self
+            .server()
             .await
             .actions
-            .insert(action_digest, result_digest);
+            .update_action_result(&action_digest, result)
+            .await?;
 
-        let result = request
-            .action_result
-            .as_ref()
-            .map(ActionResult::clone)
-            .unwrap();
         Ok(Response::new(result))
     }
 }
