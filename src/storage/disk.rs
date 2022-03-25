@@ -27,8 +27,11 @@ pub struct OnDiskStorage {
 }
 
 impl OnDiskStorage {
-    pub fn instantiate(base: &Path) -> std::io::Result<Box<dyn StorageBackend>> {
-        let base = base.to_path_buf();
+    pub fn instantiate<P>(base: P) -> std::io::Result<Box<dyn StorageBackend>>
+    where
+        P: AsRef<Path>,
+    {
+        let base = base.as_ref().to_path_buf();
         std::fs::create_dir_all(&base)?;
         drop(std::fs::File::create(base.join(
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855-0",

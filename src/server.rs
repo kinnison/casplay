@@ -19,7 +19,9 @@ use tonic::{
 use tracing::{info, span, trace, Level, Span};
 
 use crate::{
-    actioncache::{memory::MemoryActionStorage, ActionCacheStorageInstance},
+    actioncache::{
+        disk::OnDiskActionStorage, memory::MemoryActionStorage, ActionCacheStorageInstance,
+    },
     build::bazel::{
         remote::execution::v2::{
             action_cache_server::{ActionCache, ActionCacheServer},
@@ -57,9 +59,14 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let storage = match base {
         None => MemoryStorage::instantiate(),
-        Some(path) => OnDiskStorage::instantiate(path)?,
+        Some(path) => OnDiskStorage::instantiate(path.join("cas"))?,
     };
-    let action_storage = MemoryActionStorage::instantiate(storage.make_copy().await?);
+    let action_storage = match base {
+        None => MemoryActionStorage::instantiate(storage.make_copy().await?),
+        Some(path) => {
+            OnDiskActionStorage::instantiate(storage.make_copy().await?, path.join("ac"))?
+        }
+    };
     let server = Arc::new(Mutex::new(CASServer::new(
         instance_name,
         storage,
