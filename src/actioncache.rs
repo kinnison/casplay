@@ -39,6 +39,7 @@ impl ActionCacheStorage for Box<dyn ActionCacheStorage> {
 
 pub mod disk;
 pub mod memory;
+pub mod remote;
 
 #[cfg(test)]
 mod test {

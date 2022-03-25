@@ -50,8 +50,12 @@ enum Command {
 
 #[derive(Parser, Debug)]
 struct ServerData {
-    #[clap(long)]
+    #[clap(long, conflicts_with("remote"))]
     base: Option<PathBuf>,
+    #[clap(long, conflicts_with("base"))]
+    remote: Option<String>,
+    #[clap(long, conflicts_with("base"))]
+    remote_instance: Option<String>,
 }
 
 type Crapshoot = anyhow::Result<()>;
@@ -83,16 +87,36 @@ async fn real_main() -> Crapshoot {
         Command::Fetch { name } => fetch_blob(&config, &name).await?,
         Command::Upload { name } => upload_blob(&config, &name).await?,
         Command::Ls { name } => list_tree(&config, &name).await?,
-        Command::Serve(servedata) => serve(&config, servedata.base.as_deref()).await?,
+        Command::Serve(servedata) => {
+            serve(
+                &config,
+                servedata.base.as_deref(),
+                servedata.remote.as_deref(),
+                servedata.remote_instance.as_deref().unwrap_or(""),
+            )
+            .await?
+        }
     };
 
     Ok(())
 }
 
-async fn serve(config: &Config, base: Option<&Path>) -> Crapshoot {
+async fn serve(
+    config: &Config,
+    base: Option<&Path>,
+    remote: Option<&str>,
+    remote_instance: &str,
+) -> Crapshoot {
     tracing_subscriber::fmt().init();
     info!("Starting server on port 5000");
-    casplay::server::serve(([0, 0, 0, 0], 5000).into(), &config.instance_name, base).await?;
+    casplay::server::serve(
+        ([0, 0, 0, 0], 5000).into(),
+        &config.instance_name,
+        base,
+        remote,
+        remote_instance,
+    )
+    .await?;
     Ok(())
 }
 

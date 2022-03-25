@@ -20,7 +20,8 @@ use tracing::{info, span, trace, Level, Span};
 
 use crate::{
     actioncache::{
-        disk::OnDiskActionStorage, memory::MemoryActionStorage, ActionCacheStorageInstance,
+        disk::OnDiskActionStorage, memory::MemoryActionStorage, remote::RemoteActionStorage,
+        ActionCacheStorageInstance,
     },
     build::bazel::{
         remote::execution::v2::{
@@ -48,7 +49,10 @@ use crate::{
         },
         rpc,
     },
-    storage::{disk::OnDiskStorage, memory::MemoryStorage, StorageBackend, StorageBackendInstance},
+    storage::{
+        disk::OnDiskStorage, memory::MemoryStorage, remote::RemoteStorage, StorageBackend,
+        StorageBackendInstance,
+    },
 };
 
 const MAX_BATCH_BYTES: i64 = 4193280;
@@ -56,16 +60,22 @@ pub async fn serve(
     dst: SocketAddr,
     instance_name: &str,
     base: Option<&Path>,
+    remote: Option<&str>,
+    remote_instance: &str,
 ) -> anyhow::Result<()> {
-    let storage = match base {
-        None => MemoryStorage::instantiate(),
-        Some(path) => OnDiskStorage::instantiate(path.join("cas"))?,
+    let storage = match (base, remote) {
+        (None, None) => MemoryStorage::instantiate(),
+        (Some(path), None) => OnDiskStorage::instantiate(path.join("cas"))?,
+        (None, Some(url)) => RemoteStorage::instantiate(remote_instance, url).await?,
+        (_, _) => unreachable!(),
     };
-    let action_storage = match base {
-        None => MemoryActionStorage::instantiate(storage.make_copy().await?),
-        Some(path) => {
+    let action_storage = match (base, remote) {
+        (None, None) => MemoryActionStorage::instantiate(storage.make_copy().await?),
+        (Some(path), None) => {
             OnDiskActionStorage::instantiate(storage.make_copy().await?, path.join("ac"))?
         }
+        (None, Some(url)) => RemoteActionStorage::instantiate(remote_instance, url).await?,
+        (_, _) => unreachable!(),
     };
     let server = Arc::new(Mutex::new(CASServer::new(
         instance_name,

@@ -140,6 +140,7 @@ pub type StorageBackendInstance = Box<dyn StorageBackend>;
 
 pub mod disk;
 pub mod memory;
+pub mod remote;
 
 #[async_trait]
 impl StorageBackend for Box<dyn StorageBackend> {
