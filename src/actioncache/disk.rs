@@ -1,4 +1,4 @@
-//! Memory action cache, stores the action results in a CAS
+//! Disk based action cache, stores the action results in a CAS
 
 use std::path::{Path, PathBuf};
 
