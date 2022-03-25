@@ -62,15 +62,18 @@ pub async fn serve(
     base: Option<&Path>,
     remote: Option<&str>,
     remote_instance: &str,
+    lru_memory_limit: usize,
 ) -> anyhow::Result<()> {
     let storage = match (base, remote) {
-        (None, None) => MemoryStorage::instantiate(),
+        (None, None) => MemoryStorage::instantiate(lru_memory_limit),
         (Some(path), None) => OnDiskStorage::instantiate(path.join("cas"))?,
         (None, Some(url)) => RemoteStorage::instantiate(remote_instance, url).await?,
         (_, _) => unreachable!(),
     };
     let action_storage = match (base, remote) {
-        (None, None) => MemoryActionStorage::instantiate(storage.make_copy().await?),
+        (None, None) => {
+            MemoryActionStorage::instantiate(storage.make_copy().await?, lru_memory_limit >> 16)
+        }
         (Some(path), None) => {
             OnDiskActionStorage::instantiate(storage.make_copy().await?, path.join("ac"))?
         }

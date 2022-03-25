@@ -23,6 +23,7 @@ lazy_static = "*"
 tracing-subscriber = "*"
 tracing = "*"
 base64 = "*"
+lru = "*"
 
 [build-dependencies]
 tonic-build = "*"

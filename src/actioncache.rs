@@ -48,8 +48,8 @@ mod test {
 
     #[tokio::test]
     async fn store_retrieve_action() -> Result<()> {
-        let storage = MemoryStorage::instantiate();
-        let action_storage = memory::MemoryActionStorage::instantiate(storage);
+        let storage = MemoryStorage::instantiate(1024);
+        let action_storage = memory::MemoryActionStorage::instantiate(storage, 100);
         let action_digest = Digest {
             hash: "hello".into(),
             size_bytes: 5,

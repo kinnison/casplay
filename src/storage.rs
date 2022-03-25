@@ -198,10 +198,11 @@ mod test {
     use sha256::digest_bytes;
 
     use super::*;
+    const MEGABYTE: usize = 1024 * 1024;
 
     #[tokio::test]
     async fn check_missing_blobs() -> Result<()> {
-        let memory = memory::MemoryStorage::instantiate();
+        let memory = memory::MemoryStorage::instantiate(MEGABYTE);
         let empty_digest = Digest {
             hash: digest_bytes(b""),
             size_bytes: 0,
@@ -221,7 +222,7 @@ mod test {
 
     #[tokio::test]
     async fn batch_update_blobs() -> Result<()> {
-        let memory = memory::MemoryStorage::instantiate();
+        let memory = memory::MemoryStorage::instantiate(MEGABYTE);
         let hello_digest = Digest {
             hash: digest_bytes(b"hello"),
             size_bytes: 5,
@@ -241,7 +242,7 @@ mod test {
 
     #[tokio::test]
     async fn batch_read_blobs() -> Result<()> {
-        let memory = memory::MemoryStorage::instantiate();
+        let memory = memory::MemoryStorage::instantiate(MEGABYTE);
         let hello_digest = Digest {
             hash: digest_bytes(b"hello"),
             size_bytes: 5,
@@ -264,7 +265,7 @@ mod test {
 
     #[tokio::test]
     async fn read_blob() -> Result<()> {
-        let memory = memory::MemoryStorage::instantiate();
+        let memory = memory::MemoryStorage::instantiate(MEGABYTE);
         let hello_digest = Digest {
             hash: digest_bytes(b"hello"),
             size_bytes: 5,
@@ -279,7 +280,7 @@ mod test {
 
     #[tokio::test]
     async fn write_blob() -> Result<()> {
-        let memory = memory::MemoryStorage::instantiate();
+        let memory = memory::MemoryStorage::instantiate(MEGABYTE);
         let hello_digest = Digest {
             hash: digest_bytes(b"hello"),
             size_bytes: 5,

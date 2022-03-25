@@ -1,11 +1,13 @@
 //! Simple in-memory storage type
 
-use std::{cmp::min, collections::HashMap, mem::take, sync::Arc};
+use std::{cmp::min, mem::take, sync::Arc};
 
+use lru::LruCache;
 use sha256::digest_bytes;
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{async_trait, Code, Status};
+use tracing::info;
 
 use crate::build::bazel::remote::execution::v2::Digest;
 
@@ -14,19 +16,31 @@ use super::{
     WriteSession, WriteSessionInstance, WriteSessionStream,
 };
 
+struct MemoryStorageInner {
+    memory_used: usize,
+    memory_limit: usize,
+    data: LruCache<Digest, Arc<[u8]>>,
+}
 pub struct MemoryStorage {
-    content: Arc<Mutex<HashMap<Digest, Arc<[u8]>>>>,
+    content: Arc<Mutex<MemoryStorageInner>>,
 }
 
+const SIZE_DIGEST: usize = 40; /* sha256 + i64 */
+
 impl MemoryStorage {
-    pub fn instantiate() -> StorageBackendInstance {
+    pub fn instantiate(memory_limit: usize) -> StorageBackendInstance {
         let empty_digest = Digest {
             hash: digest_bytes(&[]),
             size_bytes: 0,
         };
-        let base_map = Some((empty_digest, vec![].into())).into_iter().collect();
+        let mut base_map = LruCache::unbounded();
+        base_map.put(empty_digest, vec![].into());
         Box::new(Self {
-            content: Arc::new(Mutex::new(base_map)),
+            content: Arc::new(Mutex::new(MemoryStorageInner {
+                memory_used: SIZE_DIGEST,
+                memory_limit,
+                data: base_map,
+            })),
         }) as StorageBackendInstance
     }
 }
@@ -36,7 +50,7 @@ const BLOCK_SIZE: usize = 512 * 1024;
 struct MemoryStorageWriter {
     size: usize,
     buffer: Vec<u8>,
-    content: Arc<Mutex<HashMap<Digest, Arc<[u8]>>>>,
+    content: Arc<Mutex<MemoryStorageInner>>,
 }
 
 #[async_trait]
@@ -62,10 +76,10 @@ impl WriteSession for MemoryStorageWriter {
                 size_bytes: self.buffer.len() as i64,
             };
 
-            self.content
-                .lock()
-                .await
-                .insert(new_digest.clone(), take(&mut self.buffer).into());
+            let buffer = take(&mut self.buffer);
+            let mut inner = self.content.lock().await;
+            inner.memory_used += SIZE_DIGEST + self.buffer.len();
+            inner.data.put(new_digest.clone(), buffer.into());
             Ok(new_digest)
         }
     }
@@ -80,6 +94,27 @@ impl StorageBackend for MemoryStorage {
     }
 
     async fn start_write(&self, digest: &Digest) -> Result<WriteSessionInstance> {
+        {
+            let mut lock = self.content.lock().await;
+            while lock.memory_limit < (lock.memory_used + (digest.size_bytes as usize)) {
+                // Evict one item from the cache
+                if lock.data.len() == 1 {
+                    return Err(Status::resource_exhausted("blob too large for cache"));
+                }
+                if let Some((digest, body)) = lock.data.pop_lru() {
+                    if body.is_empty() {
+                        // Empty digest, reinsert
+                        lock.data.put(digest, body);
+                    } else {
+                        info!(
+                            "Evicting {}/{} for LRU reasons",
+                            digest.hash, digest.size_bytes
+                        );
+                        lock.memory_used -= SIZE_DIGEST + body.len();
+                    }
+                }
+            }
+        }
         let writer = MemoryStorageWriter {
             size: digest.size_bytes as usize,
             buffer: Vec::with_capacity(digest.size_bytes as usize),
@@ -94,7 +129,7 @@ impl StorageBackend for MemoryStorage {
         offset: i64,
         mut limit: i64,
     ) -> Result<ReadSessionInstance> {
-        let data = match self.content.lock().await.get(digest).map(Arc::clone) {
+        let data = match self.content.lock().await.data.get(digest).map(Arc::clone) {
             Some(data) => data,
             None => return Err(Status::new(Code::NotFound, "not found")),
         };
@@ -134,7 +169,7 @@ impl StorageBackend for MemoryStorage {
     }
 
     async fn contains(&self, digest: &Digest) -> Result<bool> {
-        Ok(self.content.lock().await.contains_key(digest))
+        Ok(self.content.lock().await.data.get(digest).is_some())
     }
 }
 
@@ -148,9 +183,10 @@ mod test {
     use super::super::Result;
     use super::MemoryStorage;
 
+    const MEGABYTE: usize = 1024 * 1024;
     #[tokio::test]
     async fn new_storage_has_empty_digest() -> Result<()> {
-        let memory = MemoryStorage::instantiate();
+        let memory = MemoryStorage::instantiate(MEGABYTE);
         let empty_digest = Digest {
             hash: digest_bytes(&[]),
             size_bytes: 0,
@@ -161,7 +197,7 @@ mod test {
 
     #[tokio::test]
     async fn new_storage_doesnt_have_data() -> Result<()> {
-        let memory = MemoryStorage::instantiate();
+        let memory = MemoryStorage::instantiate(MEGABYTE);
         let some_digest = Digest {
             hash: digest_bytes(b"hello"),
             size_bytes: 5,
@@ -172,7 +208,7 @@ mod test {
 
     #[tokio::test]
     async fn can_insert_data() -> Result<()> {
-        let memory = MemoryStorage::instantiate();
+        let memory = MemoryStorage::instantiate(MEGABYTE);
         let some_digest = Digest {
             hash: digest_bytes(b"hello"),
             size_bytes: 5,
@@ -187,7 +223,7 @@ mod test {
 
     #[tokio::test]
     async fn can_retrieve_data() -> Result<()> {
-        let memory = MemoryStorage::instantiate();
+        let memory = MemoryStorage::instantiate(MEGABYTE);
         let some_digest = Digest {
             hash: digest_bytes(b"hello"),
             size_bytes: 5,

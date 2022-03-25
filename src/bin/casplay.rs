@@ -56,6 +56,8 @@ struct ServerData {
     remote: Option<String>,
     #[clap(long, conflicts_with("base"))]
     remote_instance: Option<String>,
+    #[clap(long, default_value("4294967296"))]
+    lru_memory_limit: usize,
 }
 
 type Crapshoot = anyhow::Result<()>;
@@ -93,6 +95,7 @@ async fn real_main() -> Crapshoot {
                 servedata.base.as_deref(),
                 servedata.remote.as_deref(),
                 servedata.remote_instance.as_deref().unwrap_or(""),
+                servedata.lru_memory_limit,
             )
             .await?
         }
@@ -106,6 +109,7 @@ async fn serve(
     base: Option<&Path>,
     remote: Option<&str>,
     remote_instance: &str,
+    lru_memory_limit: usize,
 ) -> Crapshoot {
     tracing_subscriber::fmt().init();
     info!("Starting server on port 5000");
@@ -115,6 +119,7 @@ async fn serve(
         base,
         remote,
         remote_instance,
+        lru_memory_limit,
     )
     .await?;
     Ok(())
