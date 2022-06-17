@@ -16,7 +16,7 @@ clap = { version = "3", features = ["derive"] }
 sha256 = "*"
 async-stream = "*"
 async-recursion = "*"
-uuid = { version = "0.8", features = ["v4"] }
+uuid = { version = "1.1", features = ["v4"] }
 bytes = "*"
 regex = "*"
 lazy_static = "*"
