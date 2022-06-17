@@ -10,11 +10,17 @@ use std::os::unix::fs::PermissionsExt;
 use async_recursion::async_recursion;
 use async_stream::stream;
 use casplay::{
-    build::bazel::remote::execution::v2::{
-        capabilities_client::CapabilitiesClient,
-        content_addressable_storage_client::ContentAddressableStorageClient, Digest, Directory,
-        DirectoryNode, FileNode, FindMissingBlobsRequest, GetCapabilitiesRequest, GetTreeRequest,
-        SymlinkNode,
+    build::bazel::remote::{
+        asset::v1::{
+            fetch_client::FetchClient, push_client::PushClient, FetchBlobRequest,
+            FetchDirectoryRequest, PushBlobRequest, PushDirectoryRequest, Qualifier,
+        },
+        execution::v2::{
+            capabilities_client::CapabilitiesClient,
+            content_addressable_storage_client::ContentAddressableStorageClient, Digest, Directory,
+            DirectoryNode, FileNode, FindMissingBlobsRequest, GetCapabilitiesRequest,
+            GetTreeRequest, SymlinkNode,
+        },
     },
     google::bytestream::{byte_stream_client::ByteStreamClient, ReadRequest, WriteRequest},
     Uploader,
@@ -46,6 +52,8 @@ enum Command {
     Upload { name: PathBuf },
     Ls { name: String },
     Serve(ServerData),
+    PushAsset(AssetPushData),
+    FetchAsset(AssetFetchData),
 }
 
 #[derive(Parser, Debug)]
@@ -58,6 +66,26 @@ struct ServerData {
     remote_instance: Option<String>,
     #[clap(long, default_value("4294967296"))]
     lru_memory_limit: usize,
+}
+
+#[derive(Parser, Debug)]
+struct AssetPushData {
+    #[clap(long, short = 'd')]
+    directory: bool,
+    #[clap(long, short = 'u')]
+    uri: Vec<String>,
+    #[clap(long, short = 'q')]
+    qualifier: Vec<String>,
+    digest: String,
+}
+
+#[derive(Parser, Debug)]
+struct AssetFetchData {
+    #[clap(long, short = 'd')]
+    directory: bool,
+    #[clap(long, short = 'q')]
+    qualifier: Vec<String>,
+    uri: Vec<String>,
 }
 
 type Crapshoot = anyhow::Result<()>;
@@ -99,6 +127,8 @@ async fn real_main() -> Crapshoot {
             )
             .await?
         }
+        Command::PushAsset(data) => push_asset(&config, data).await?,
+        Command::FetchAsset(data) => fetch_asset(&config, data).await?,
     };
 
     Ok(())
@@ -403,4 +433,121 @@ async fn upload_dir_(
     this_dir.symlinks.sort_by_key(|e| e.name.clone());
 
     Ok(uploader.queue_message(this_dir).await?)
+}
+
+async fn push_asset(config: &Config, data: AssetPushData) -> Crapshoot {
+    if data.uri.is_empty() {
+        anyhow::bail!("At least one URI must be provided");
+    }
+    let mut qualifiers = HashMap::new();
+    for qualifier in &data.qualifier {
+        if let Some((key, value)) = qualifier.split_once('=') {
+            if qualifiers.contains_key(key) {
+                anyhow::bail!("Repeated qualifier '{}'", key);
+            }
+            qualifiers.insert(key.to_string(), value.to_string());
+        } else {
+            anyhow::bail!(
+                "Invalid qualifier '{}', correct form is key=value",
+                qualifier
+            );
+        }
+    }
+
+    let digest = if let Some((hash, len)) = data.digest.split_once('/') {
+        Digest {
+            hash: hash.to_string(),
+            size_bytes: len.parse()?,
+        }
+    } else {
+        anyhow::bail!("Invalid digest: '{}'", data.digest);
+    };
+
+    let mut server = PushClient::connect(config.endpoint.clone()).await?;
+
+    if data.directory {
+        let req = PushDirectoryRequest {
+            instance_name: config.instance_name.clone(),
+            uris: data.uri.clone(),
+            qualifiers: qualifiers
+                .into_iter()
+                .map(|(k, v)| Qualifier { name: k, value: v })
+                .collect(),
+            expire_at: None,
+            root_directory_digest: Some(digest),
+            references_blobs: vec![],
+            references_directories: vec![],
+        };
+        server.push_directory(req).await?;
+    } else {
+        let req = PushBlobRequest {
+            instance_name: config.instance_name.clone(),
+            uris: data.uri.clone(),
+            qualifiers: qualifiers
+                .into_iter()
+                .map(|(k, v)| Qualifier { name: k, value: v })
+                .collect(),
+            expire_at: None,
+            blob_digest: Some(digest),
+            references_blobs: vec![],
+            references_directories: vec![],
+        };
+        server.push_blob(req).await?;
+    }
+    Ok(())
+}
+
+async fn fetch_asset(config: &Config, data: AssetFetchData) -> Crapshoot {
+    if data.uri.is_empty() {
+        anyhow::bail!("At least one URI must be provided");
+    }
+    let mut qualifiers = HashMap::new();
+    for qualifier in &data.qualifier {
+        if let Some((key, value)) = qualifier.split_once('=') {
+            if qualifiers.contains_key(key) {
+                anyhow::bail!("Repeated qualifier '{}'", key);
+            }
+            qualifiers.insert(key.to_string(), value.to_string());
+        } else {
+            anyhow::bail!(
+                "Invalid qualifier '{}', correct form is key=value",
+                qualifier
+            );
+        }
+    }
+
+    let mut server = FetchClient::connect(config.endpoint.clone()).await?;
+
+    if data.directory {
+        let req = FetchDirectoryRequest {
+            instance_name: config.instance_name.clone(),
+            timeout: None,
+            oldest_content_accepted: None,
+            uris: data.uri.clone(),
+            qualifiers: qualifiers
+                .into_iter()
+                .map(|(k, v)| Qualifier { name: k, value: v })
+                .collect(),
+        };
+        let res = server.fetch_directory(req).await?.into_inner();
+        let digest = res
+            .root_directory_digest
+            .ok_or_else(|| anyhow::anyhow!("wha?"))?;
+        println!("{}/{}", digest.hash, digest.size_bytes);
+    } else {
+        let req = FetchBlobRequest {
+            instance_name: config.instance_name.clone(),
+            timeout: None,
+            oldest_content_accepted: None,
+            uris: data.uri.clone(),
+            qualifiers: qualifiers
+                .into_iter()
+                .map(|(k, v)| Qualifier { name: k, value: v })
+                .collect(),
+        };
+        let res = server.fetch_blob(req).await?.into_inner();
+        let digest = res.blob_digest.ok_or_else(|| anyhow::anyhow!("wha?"))?;
+        println!("{}/{}", digest.hash, digest.size_bytes);
+    }
+    Ok(())
 }

@@ -9,6 +9,11 @@ pub mod build {
                     tonic::include_proto!("build.bazel.remote.execution.v2");
                 }
             }
+            pub mod asset {
+                pub mod v1 {
+                    tonic::include_proto!("build.bazel.remote.asset.v1");
+                }
+            }
         }
     }
 }
@@ -36,4 +41,5 @@ pub use uploader::Uploader;
 pub mod server;
 
 pub mod actioncache;
+pub mod assets;
 pub mod storage;

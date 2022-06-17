@@ -23,21 +23,30 @@ use crate::{
         disk::OnDiskActionStorage, memory::MemoryActionStorage, remote::RemoteActionStorage,
         ActionCacheStorageInstance,
     },
+    assets::{memory::MemoryAssetStorage, AssetCacheStorageInstance},
     build::bazel::{
-        remote::execution::v2::{
-            action_cache_server::{ActionCache, ActionCacheServer},
-            batch_read_blobs_response, batch_update_blobs_response,
-            capabilities_server::{Capabilities, CapabilitiesServer},
-            compressor,
-            content_addressable_storage_server::{
-                ContentAddressableStorage, ContentAddressableStorageServer,
+        remote::{
+            asset::v1::{
+                fetch_server::{Fetch, FetchServer},
+                push_server::{Push, PushServer},
+                FetchBlobRequest, FetchBlobResponse, FetchDirectoryRequest, FetchDirectoryResponse,
+                PushBlobRequest, PushBlobResponse, PushDirectoryRequest, PushDirectoryResponse,
             },
-            digest_function, symlink_absolute_path_strategy, ActionCacheUpdateCapabilities,
-            ActionResult, BatchReadBlobsRequest, BatchReadBlobsResponse, BatchUpdateBlobsRequest,
-            BatchUpdateBlobsResponse, CacheCapabilities, Digest, Directory,
-            FindMissingBlobsRequest, FindMissingBlobsResponse, GetActionResultRequest,
-            GetCapabilitiesRequest, GetTreeRequest, GetTreeResponse, RequestMetadata,
-            ServerCapabilities, ToolDetails, Tree, UpdateActionResultRequest,
+            execution::v2::{
+                action_cache_server::{ActionCache, ActionCacheServer},
+                batch_read_blobs_response, batch_update_blobs_response,
+                capabilities_server::{Capabilities, CapabilitiesServer},
+                compressor,
+                content_addressable_storage_server::{
+                    ContentAddressableStorage, ContentAddressableStorageServer,
+                },
+                digest_function, symlink_absolute_path_strategy, ActionCacheUpdateCapabilities,
+                ActionResult, BatchReadBlobsRequest, BatchReadBlobsResponse,
+                BatchUpdateBlobsRequest, BatchUpdateBlobsResponse, CacheCapabilities, Digest,
+                Directory, FindMissingBlobsRequest, FindMissingBlobsResponse,
+                GetActionResultRequest, GetCapabilitiesRequest, GetTreeRequest, GetTreeResponse,
+                RequestMetadata, ServerCapabilities, ToolDetails, Tree, UpdateActionResultRequest,
+            },
         },
         semver::SemVer,
     },
@@ -80,10 +89,12 @@ pub async fn serve(
         (None, Some(url)) => RemoteActionStorage::instantiate(remote_instance, url).await?,
         (_, _) => unreachable!(),
     };
+    let asset_storage = MemoryAssetStorage::instantiate(storage.make_copy().await?);
     let server = Arc::new(Mutex::new(CASServer::new(
         instance_name,
         storage,
         action_storage,
+        asset_storage,
     )));
     Server::builder()
         .trace_fn(tracing_span)
@@ -98,6 +109,12 @@ pub async fn serve(
             Arc::clone(&server),
         )))
         .add_service(ActionCacheServer::new(PlayActionCache::new(Arc::clone(
+            &server,
+        ))))
+        .add_service(PushServer::new(PlayAssetPushServer::new(Arc::clone(
+            &server,
+        ))))
+        .add_service(FetchServer::new(PlayAssetFetchServer::new(Arc::clone(
             &server,
         ))))
         .serve(dst)
@@ -168,6 +185,7 @@ struct CASServer {
     instance_name: String,
     storage: StorageBackendInstance,
     actions: ActionCacheStorageInstance,
+    assets: AssetCacheStorageInstance,
 }
 
 impl CASServer {
@@ -175,11 +193,13 @@ impl CASServer {
         instance_name: &str,
         storage: StorageBackendInstance,
         actions: ActionCacheStorageInstance,
+        assets: AssetCacheStorageInstance,
     ) -> Self {
         Self {
             instance_name: instance_name.to_string(),
             storage,
             actions,
+            assets,
         }
     }
 }
@@ -782,5 +802,118 @@ impl ActionCache for PlayActionCache {
             .await?;
 
         Ok(Response::new(result))
+    }
+}
+
+#[derive(Clone)]
+struct PlayAssetPushServer {
+    inner: Arc<Mutex<CASServer>>,
+}
+
+impl PlayAssetPushServer {
+    fn new(inner: Arc<Mutex<CASServer>>) -> Self {
+        Self { inner }
+    }
+
+    async fn server(&self) -> MutexGuard<'_, CASServer> {
+        self.inner.lock().await
+    }
+}
+
+#[async_trait]
+impl Push for PlayAssetPushServer {
+    async fn push_blob(
+        &self,
+        request: Request<PushBlobRequest>,
+    ) -> Result<Response<PushBlobResponse>, Status> {
+        if request.get_ref().instance_name != self.server().await.instance_name {
+            return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
+        }
+
+        // TODO: Add all relevant checks (e.g. is content in CAS, are qualifiers sane, etc)
+
+        let res = self
+            .server()
+            .await
+            .assets
+            .push_blob(request.into_inner())
+            .await?;
+        Ok(Response::new(res))
+    }
+
+    async fn push_directory(
+        &self,
+        request: Request<PushDirectoryRequest>,
+    ) -> Result<Response<PushDirectoryResponse>, Status> {
+        if request.get_ref().instance_name != self.server().await.instance_name {
+            return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
+        }
+
+        // TODO: Add all relevant checks (e.g. is content in CAS, are qualifiers sane, etc)
+
+        let res = self
+            .server()
+            .await
+            .assets
+            .push_directory(request.into_inner())
+            .await?;
+        Ok(Response::new(res))
+    }
+}
+
+#[derive(Clone)]
+struct PlayAssetFetchServer {
+    inner: Arc<Mutex<CASServer>>,
+}
+
+impl PlayAssetFetchServer {
+    fn new(inner: Arc<Mutex<CASServer>>) -> Self {
+        Self { inner }
+    }
+
+    async fn server(&self) -> MutexGuard<'_, CASServer> {
+        self.inner.lock().await
+    }
+}
+
+#[async_trait]
+impl Fetch for PlayAssetFetchServer {
+    async fn fetch_blob(
+        &self,
+        request: Request<FetchBlobRequest>,
+    ) -> Result<Response<FetchBlobResponse>, Status> {
+        if request.get_ref().instance_name != self.server().await.instance_name {
+            return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
+        }
+
+        let res = self
+            .server()
+            .await
+            .assets
+            .fetch_blob(request.into_inner())
+            .await?;
+
+        // TODO: Add all relevant checks (e.g. is content in CAS, are qualifiers sane, etc)
+
+        Ok(Response::new(res))
+    }
+    async fn fetch_directory(
+        &self,
+        request: Request<FetchDirectoryRequest>,
+    ) -> Result<Response<FetchDirectoryResponse>, Status> {
+        if request.get_ref().instance_name != self.server().await.instance_name {
+            return Err(Status::new(Code::InvalidArgument, "Unknown instance"));
+        }
+
+        let res = self
+            .server()
+            .await
+            .assets
+            .fetch_directory(request.into_inner())
+            .await?;
+
+        // TODO: Add all relevant checks (e.g. is content in CAS, are qualifiers sane, etc)
+
+        Ok(Response::new(res))
     }
 }
